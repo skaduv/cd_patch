@@ -2,7 +2,7 @@
 
 用于 Windows x64 Claude Desktop 的本地 PowerShell 补丁脚本。直接修改当前 Windows 用户已注册的 Claude 安装目录。
 
-脚本原地调整模型、工具与遥测相关代码，更新 ASAR 完整性哈希及 EXE 内嵌哈希，并备份原始文件。不复制整套应用，不卸载或重新注册应用。
+脚本原地调整模型、工具与遥测相关代码，更新 ASAR 完整性哈希及 EXE 内嵌哈希，并备份原始文件。不复制整套应用，不卸载或重新注册应用。ASAR 采用流式单遍校验与重建，峰值内存约为单个文件大小，而非数倍于整个包。
 
 ## 功能
 
@@ -16,13 +16,15 @@
 - **遥测**：默认启用 `disableEssentialTelemetry` 和 `disableNonessentialTelemetry`，在 1p 模式中强制关闭对应遥测，并设置 Code 子进程禁用遥测、错误报告的环境变量。
 - **备份与恢复**：修改前自动备份，恢复前后校验 SHA256。
 - **离线设置入口**：主窗口顶部保留 40px 本地菜单栏，左上角菜单不依赖官网登录页加载；通过“文件 → Configure Third-Party Inference…”打开内置第三方 API 配置页，地区不可用或断网时也能进入。配置页可离线填写，验证凭据和调用模型仍需连接对应提供方。
+- **重复运行秒退**：检测到 `patch-report.json` 记录的补丁已应用（EXE 内已含本次构建哈希）时直接退出，不重复走全流程。
+- **进度与诊断输出**：ASAR 校验/重建按 64MB 打进度；启动时打印实际使用的 Python/Node 路径与版本；结束 Claude 进程时打印数量。Python 会做真实 `--version` 探测，Microsoft Store 占位符会被识别并跳过。
 
 自动发现、工具搜索、WebFetch 预检跳过和内置浏览器设置允许显式 `false` 关闭；1p 遥测使用强制覆盖。
 
 ## 环境要求
 
 - Python 3.10 或更高版本。
-- Node.js 24 或更高版本，用于检查新版 JavaScript 语法。
+- Node.js 24 或更高版本，用于检查补丁后 JavaScript 语法；找不到时自动跳过校验并警告（也可用 `-SkipSyntaxCheck` 显式跳过）。
 - 已安装并为当前 Windows 用户注册 Claude Desktop。
 - 修改和恢复时，需对安装目录及程序文件具有写入权限；建议使用同一 Windows 用户以管理员身份运行 PowerShell。WindowsApps 目录即使提权后也可能拒绝写入，脚本会检查并报错，不会自动更改目录所有权或权限。无需开启开发者模式。
 
@@ -73,6 +75,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 | `-InstallDir <路径>` | 选择当前用户已注册的 Claude 安装根目录 |
 | `-PythonPath <路径>` | 指定 Python 可执行文件 |
 | `-NodePath <路径>` | 指定 Node.js 可执行文件 |
+| `-SkipSyntaxCheck` | 跳过 JavaScript 语法校验（无 Node.js 时自动跳过并警告） |
 
 ## 已知限制
 
