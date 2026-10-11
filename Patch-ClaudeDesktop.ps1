@@ -536,12 +536,15 @@ def main():
             except Exception: prev={}
         fa=prev.get('frontendAsset') or {}
         fa_path=app/fa['path'] if isinstance(fa.get('path'),str) else None
+        exe_path=app/'claude.exe'
+        asar_path=app/'resources/app.asar'
         if (prev and not prev.get('resourcesRestored')
                 and prev.get('engineSHA256')==engine_id
-                and isinstance(prev.get('newHeaderSHA256'),str)
-                and prev['newHeaderSHA256'].encode('ascii') in (app/'claude.exe').read_bytes()
+                and not (not args.skip_syntax_check and prev.get('syntaxCheckSkipped'))
+                and isinstance(prev.get('exeSHA256'),str)
+                and prev['exeSHA256']==sha_file(exe_path)
                 and isinstance(prev.get('asarSHA256'),str)
-                and prev['asarSHA256']==sha_file(app/'resources/app.asar')
+                and prev['asarSHA256']==sha_file(asar_path)
                 and fa_path is not None and fa_path.resolve().is_relative_to(app.resolve())
                 and isinstance(fa.get('sha256'),str) and fa['sha256']==sha_file(fa_path)):
             log('Already patched: installed files match this patch build. Nothing to do.')
