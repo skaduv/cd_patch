@@ -528,16 +528,24 @@ def main():
     inventory_path=backup/'inventory.json'
     inv=json.loads(inventory_path.read_text(encoding='utf8')) if inventory_path.exists() else {}
     if not args.check_only and not args.restore:
-        # Skip quickly when this exact patch build is already applied.
+        # Skip quickly when the installed files exactly match this patch build.
         prev={}
         prev_path=app.parent/'patch-report.json'
         if prev_path.exists():
             try: prev=json.loads(prev_path.read_text(encoding='utf8'))
             except Exception: prev={}
-        if prev and not prev.get('resourcesRestored') and prev.get('newHeaderSHA256') and prev.get('engineSHA256')==engine_id:
-            if prev['newHeaderSHA256'].encode('ascii') in (app/'claude.exe').read_bytes():
-                log('Already patched: claude.exe already contains this patch build. Nothing to do.')
-                return
+        fa=prev.get('frontendAsset') or {}
+        fa_path=app/fa['path'] if isinstance(fa.get('path'),str) else None
+        if (prev and not prev.get('resourcesRestored')
+                and prev.get('engineSHA256')==engine_id
+                and isinstance(prev.get('newHeaderSHA256'),str)
+                and prev['newHeaderSHA256'].encode('ascii') in (app/'claude.exe').read_bytes()
+                and isinstance(prev.get('asarSHA256'),str)
+                and prev['asarSHA256']==sha_file(app/'resources/app.asar')
+                and fa_path is not None and fa_path.resolve().is_relative_to(app.resolve())
+                and isinstance(fa.get('sha256'),str) and fa['sha256']==sha_file(fa_path)):
+            log('Already patched: installed files match this patch build. Nothing to do.')
+            return
     baseline_asar=backup/'files/resources/app.asar'
     source=baseline_asar if baseline_asar.exists() else app/'resources/app.asar'
     report=[]
@@ -561,6 +569,7 @@ def main():
         front_text=patch_discovery_default(front_text,'frontend model discovery default true',report)
         front_text=patch_telemetry_defaults(front_text,'frontend',report)
         writes[front[0]]=patch_browser_default(front_text,'frontend',report).encode('utf8')
+        front_rel=front[0].relative_to(app).as_posix()
         if args.skip_syntax_check:
             log('WARNING: JavaScript syntax verification skipped (--skip-syntax-check).')
         else:
@@ -581,7 +590,8 @@ def main():
             'asarSHA256':asar_sha256,'exeSHA256':sha(patched_exe),
             'signedExeSignatureInvalidated':True,'runtimeTested':False,'resourcesRestored':False,
             'streamingBuild':True,'syntaxCheckSkipped':args.skip_syntax_check,
-            'engineSHA256':engine_id}
+            'engineSHA256':engine_id,
+            'frontendAsset':{'path':front_rel,'sha256':sha(writes[front[0]])}}
         if args.check_only:
             log(json.dumps(report_obj,ensure_ascii=False,indent=2));log('CHECK ONLY: no application files changed.');return
         writes[exe_path]=patched_exe
