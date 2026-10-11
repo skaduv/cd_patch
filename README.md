@@ -1,8 +1,8 @@
 # Claude Desktop Patch
 
-用于 Windows x64 Claude Desktop 的本地 PowerShell 补丁脚本。生成可注册的开发版应用目录，无需重新打包或发布 MSIX。
+用于 Windows x64 Claude Desktop 的本地 PowerShell 补丁脚本。直接修改当前 Windows 用户已注册的 Claude 安装目录。
 
-脚本在独立副本中调整模型、工具与遥测相关代码，更新 ASAR 完整性哈希及 EXE 内嵌哈希，并备份原始文件。默认仅准备副本；只有指定 `-Activate` 才会替换当前用户的应用注册。
+脚本原地调整模型、工具与遥测相关代码，更新 ASAR 完整性哈希及 EXE 内嵌哈希，并备份原始文件。不复制整套应用，不卸载或重新注册应用。
 
 ## 功能
 
@@ -23,57 +23,34 @@
 
 - Python 3.10 或更高版本。
 - Node.js 24 或更高版本，用于检查新版 JavaScript 语法。
-- 激活修改版时，需要开启 Windows 开发者模式，并使用同一 Windows 用户以管理员身份运行 PowerShell。此版本包含 Windows 服务，普通权限无法完成注册；脚本会在移除当前注册前检查权限。
+- 已安装并为当前 Windows 用户注册 Claude Desktop。
+- 修改和恢复时，需对安装目录及程序文件具有写入权限；建议使用同一 Windows 用户以管理员身份运行 PowerShell。WindowsApps 目录即使提权后也可能拒绝写入，脚本会检查并报错，不会自动更改目录所有权或权限。无需开启开发者模式。
 
 ## 快速开始
 
-### 1. 开启开发者模式（仅激活时需要）
-
-仅检查兼容性或准备副本时，可以跳过此步。
-
-按 **Win + I** 打开 Windows 设置，搜索“开发者模式”，开启并确认提示。
-
-- 新版 Windows 11：**系统 → 高级 → 开发者选项**。
-- 较旧 Windows 11：**隐私和安全性 → 开发者选项**。
-- Windows 10：**更新和安全 → 开发者选项**。
-
-无需开启设备门户或设备发现。参见 [Microsoft 开发者模式文档](https://learn.microsoft.com/en-us/windows/advanced-settings/developer-mode)。
-
-### 2. 检查兼容性
+### 1. 检查兼容性
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop.ps1" -CheckOnly
 ```
 
-检查应用结构、补丁匹配、JavaScript 语法和生成结果的完整性，不激活或启动应用。默认优先检查已有副本；没有副本时读取当前官方安装。指定 `-MsixPath` 时会先提取到副本目录。
+自动定位当前用户已注册的 Claude，检查应用结构、补丁匹配、JavaScript 语法和生成结果的完整性。不修改程序文件、不关闭或启动应用。
 
-### 3. 准备副本并按需激活
+### 2. 修改当前安装
 
-只准备修改版副本，保留当前 Claude 的注册状态：
+退出 Claude，使用同一 Windows 用户以管理员身份打开 PowerShell，运行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop.ps1"
 ```
 
-需要切换到修改版时，以同一 Windows 用户身份打开管理员 PowerShell，再运行：
+脚本会关闭目标安装目录下仍在运行的 Claude 进程，检查写入权限，备份原始资源并直接写入补丁。完成后手动启动 Claude，并新建会话使会话设置生效。应用注册和用户数据保持不变。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop.ps1" -Activate
-```
+如果当前用户注册了多个 Claude 安装，可用 `-InstallDir` 指定其中一个安装根目录（包含 `AppxManifest.xml` 的目录）。该参数不能指向未注册的目录。
 
-脚本准备修改副本并完成校验后，询问是否替换当前用户的 Claude 应用注册。输入 `y` 后继续。
+再次执行同一命令即可更新补丁，脚本保留首次原始资源备份。Claude 本体升级后，需确认新版本受脚本支持，并针对新的安装目录重新应用补丁；不要跨版本搬用备份。
 
-不加 `-Activate` 只准备副本。默认目录为 `\路径\ClaudeDesktop-Patched`；如检测到先前的旧命名目录，脚本会继续使用该目录及其原始备份。
-
-激活后，重启 Claude 并新建会话，使会话设置生效。界面语言使用 Claude 官方提供的语言设置，脚本不下载、替换语言资源或修改语言菜单。
-
-### 4. 更新已有副本
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop.ps1" -PatchOnly -Activate
-```
-
-自定义过安装目录时，添加相同的 `-InstallDir`。`-PatchOnly` 只更新已有副本的补丁，不升级 Claude 本体。旧副本版本不同时，请从当前官方安装创建新的 `-InstallDir`，不要混用不同版本的文件或备份。
+界面语言使用 Claude 官方提供的语言设置，脚本不下载、替换语言资源或修改语言菜单。
 
 ## 备份与恢复
 
@@ -85,29 +62,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 
 `-RestoreOriginal` 是 `-Restore` 的同义参数。恢复无需 Node.js，仍需要 Python。
 
-恢复会还原脚本修改的 EXE、ASAR 和前端文件；旧版备份中记录的新增文件仍会按清单删除。恢复不会回退账号数据或恢复官方签名安装的应用注册方式。回到官方安装方式需要重新安装官方包。
-
-激活前另行保存原应用布局与用户数据快照，位于 `registration-backup`。快照可能包含登录信息，应仅在本机保管。
+恢复会还原脚本修改的 EXE、ASAR 和前端文件；旧版备份中记录的新增文件仍会按清单删除。恢复不会回退账号数据或更改应用注册。若备份丢失，可重新安装官方包恢复程序文件。
 
 ## 参数
 
 | 参数 | 说明 |
 | --- | --- |
 | `-CheckOnly` | 检查兼容性与补丁结果 |
-| `-Activate` | 注册修改版并启动 |
-| `-PatchOnly` | 使用已有副本，不重新复制安装布局 |
 | `-Restore` | 恢复原始程序资源 |
-| `-InstallDir <路径>` | 指定修改副本目录 |
-| `-MsixPath <路径>` | 从原版 MSIX 提取应用 |
+| `-InstallDir <路径>` | 选择当前用户已注册的 Claude 安装根目录 |
 | `-PythonPath <路径>` | 指定 Python 可执行文件 |
 | `-NodePath <路径>` | 指定 Node.js 可执行文件 |
-| `-NoLaunch` | 激活后不启动应用 |
-| `-Yes` | 跳过应用注册替换确认 |
 
 ## 已知限制
 
 - 补丁严格检查版本和每个替换点的匹配数量；Claude 更新后需要重新适配。
-- 修改 EXE 会使原 Anthropic 数字签名失效；脚本会重新计算并保留 ASAR 完整性校验。
+- 修改 EXE 会使原 Anthropic 数字签名失效；脚本会重新计算并保留 ASAR 完整性校验。原地修改不会更新 MSIX 包签名，Windows 的包完整性检查可能阻止启动或触发修复；官方更新也可能覆盖补丁。
 - 客户端仍使用 Anthropic Messages 协议；任意模型名称通过校验，不代表网关或模型支持全部工具协议。
 - 工具搜索、Computer Use 和 Browser Use 的实际可用性取决于后端能力、组织策略及系统授权。
 - 遥测修改未经过完整联网抓包验收，独立 OTLP 导出不在覆盖范围内，不能保证所有遥测流量为零。

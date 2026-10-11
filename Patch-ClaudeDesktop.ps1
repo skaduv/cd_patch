@@ -2,16 +2,11 @@
 
 [CmdletBinding()]
 param(
-    [string]$MsixPath = '',
     [string]$InstallDir = '',
     [string]$PythonPath = '',
     [string]$NodePath = '',
     [switch]$CheckOnly,
-    [switch]$PatchOnly,
-    [switch]$Activate,
-    [Alias('RestoreOriginal')][switch]$Restore,
-    [switch]$NoLaunch,
-    [switch]$Yes
+    [Alias('RestoreOriginal')][switch]$Restore
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -43,86 +38,30 @@ function Check-Manifest([string]$Root) {
     }
     if ($manifest.Package.Identity.ProcessorArchitecture -ne 'x64') { throw 'Only x64 was verified.' }
 }
-function Copy-DirectoryTree([string]$Source,[string]$Destination) {
-    # Robocopy supports long Windows paths without requiring PowerShell 5.1
-    # Copy-Item to traverse Chromium cache filenames. Do not use /256.
-    $copyLog = Join-Path ([IO.Path]::GetTempPath()) ('claude-copy-' + [Guid]::NewGuid().ToString('N') + '.log')
-    & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /XJ /R:2 /W:1 /NP /NFL /NDL /NJH /NJS "/LOG:$copyLog" | Out-Null
-    $copyExit = $LASTEXITCODE
-    if ($copyExit -ge 8) { throw "Directory backup/copy failed (robocopy exit $copyExit). Current registration has not been removed during backup. See $copyLog" }
-    if (Test-Path -LiteralPath $copyLog) { Remove-Item -LiteralPath $copyLog -Force }
-}
-function Restore-PackageData([string]$Snapshot,[string]$Family) {
-    if (-not (Test-Path -LiteralPath $Snapshot)) { return }
-    $dataRoot = Join-Path (Join-Path $env:LOCALAPPDATA 'Packages') $Family
-    New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
-    Copy-DirectoryTree $Snapshot $dataRoot
-}
-
 try {
-    if ($Restore -and ($CheckOnly -or $Activate)) { throw '-Restore cannot be combined with -CheckOnly/-Activate.' }
-    if ($CheckOnly -and $Activate) { throw '-CheckOnly cannot activate an application.' }
-    if (-not $InstallDir) {
-        $InstallDir = Join-Path $PSScriptRoot 'ClaudeDesktop-Patched'
-        # Continue an existing layout instead of abandoning its original backup.
-        $legacyLayout = Join-Path $PSScriptRoot 'ClaudeDesktop-Patched-2.16120.0.0'
-        if (-not (Test-Path -LiteralPath $InstallDir) -and (Test-Path -LiteralPath (Join-Path $legacyLayout 'AppxManifest.xml'))) {
-            $InstallDir = $legacyLayout
-        }
+    if ($Restore -and $CheckOnly) { throw '-Restore cannot be combined with -CheckOnly.' }
+    $installed = @(Get-AppxPackage -Name Claude -ErrorAction Stop)
+    if ($InstallDir) {
+        $InstallDir = (Resolve-Path -LiteralPath $InstallDir).Path.TrimEnd('\')
+        $installed = @($installed | Where-Object { $_.InstallLocation.TrimEnd('\') -eq $InstallDir })
     }
-    $InstallDir = [IO.Path]::GetFullPath($InstallDir)
-    if ($InstallDir -match '(?i)\\WindowsApps(?:\\|$)') { throw 'Choose a directory outside WindowsApps.' }
-    if ($InstallDir -eq [IO.Path]::GetPathRoot($InstallDir)) { throw 'InstallDir cannot be a drive root.' }
+    if ($installed.Count -ne 1) { throw 'Expected one registered Claude installation for the current user. If multiple exist, select one with -InstallDir.' }
+    $InstallDir = $installed[0].InstallLocation
+    Check-Manifest $InstallDir
+    $AppDir = Join-Path $InstallDir 'app'
     $PythonPath = Resolve-Runtime $PythonPath 'python.exe' @(
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
     )
     if ($Restore) { $NodePath = 'unused-for-restore' }
     else { $NodePath = Resolve-Runtime $NodePath 'node.exe' @('D:\nodejs\node.exe') }
-    $installed = @(Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue)
-    $matching = @($installed | Sort-Object Version -Descending | Select-Object -First 1)
-    $AppDir = Join-Path $InstallDir 'app'
-    if ($Restore -or $PatchOnly) {
-        Check-Manifest $InstallDir
-        if (-not $CheckOnly) { Stop-TargetClaude $AppDir }
-    } elseif ($CheckOnly -and -not $MsixPath -and -not (Test-Path -LiteralPath $AppDir)) {
-        if ($matching.Count -ne 1) { throw 'Claude is not installed.' }
-        Check-Manifest $matching[0].InstallLocation
-        $AppDir = Join-Path $matching[0].InstallLocation 'app'
-    } elseif (-not (Test-Path -LiteralPath (Join-Path $AppDir 'resources\app.asar'))) {
-        if (Test-Path -LiteralPath $InstallDir) { throw 'InstallDir already exists without complete application files. Choose a new directory.' }
-        if ($MsixPath) {
-            $MsixPath = (Resolve-Path -LiteralPath $MsixPath).Path
-            Info "Extracting MSIX to $InstallDir"
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            # Validate ZIP destination paths before extracting untrusted archives.
-            $zip = [IO.Compression.ZipFile]::OpenRead($MsixPath)
-            try {
-                $prefix = $InstallDir.TrimEnd('\') + '\'
-                foreach ($entry in $zip.Entries) {
-                    $dest = [IO.Path]::GetFullPath((Join-Path $InstallDir $entry.FullName))
-                    if (-not $dest.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) { throw 'MSIX contains an unsafe entry path.' }
-                }
-            } finally { $zip.Dispose() }
-            [IO.Compression.ZipFile]::ExtractToDirectory($MsixPath,$InstallDir)
-        } else {
-            if ($matching.Count -ne 1) { throw 'Install Claude or supply -MsixPath.' }
-            $sourceRoot = $matching[0].InstallLocation
-            Check-Manifest $sourceRoot
-            Info "Copying installed package to $InstallDir (current install stays active)"
-            New-Item -ItemType Directory -Path $InstallDir | Out-Null
-            Copy-DirectoryTree $sourceRoot $InstallDir
-        }
-        Check-Manifest $InstallDir
-    } else {
-        Check-Manifest $InstallDir
-        if (-not $CheckOnly) { Stop-TargetClaude $AppDir }
-    }
+    Info "Target current Claude installation: $InstallDir"
+    if (-not $CheckOnly) { Stop-TargetClaude $AppDir }
 
     # Backend is embedded to keep the patch engine in a single PS1.
     $backend = @'
 """Claude Desktop 2.31226.1.0 patch engine. Standard library only.
 
-Never writes to WindowsApps. PowerShell wrapper owns package registration.
+Patches the registered installation in place; package registration is unchanged.
 """
 import argparse, copy, hashlib, json, os, pathlib, re, shutil, struct, subprocess, sys, tempfile, xml.etree.ElementTree as ET
 
@@ -354,7 +293,6 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--app',required=True)
     p.add_argument('--node',required=True);p.add_argument('--check-only',action='store_true');p.add_argument('--restore',action='store_true')
     args=p.parse_args();app=pathlib.Path(args.app).resolve()
-    if 'windowsapps' in str(app).lower() and not args.check_only: raise ValueError('Refusing to modify WindowsApps')
     if not (app/'resources/app.asar').is_file():raise ValueError('Not a Claude app directory')
     manifest=app.parent/'AppxManifest.xml'
     detected_version='unknown'
@@ -369,7 +307,17 @@ def main():
     if not backup.exists() and legacy_backup.exists():
         if args.check_only: backup=legacy_backup
         else: legacy_backup.rename(backup)
-    if not args.check_only:backup.mkdir(parents=True,exist_ok=True)
+    if not args.check_only:
+        # Check directory creation and existing-file writes before changing resources.
+        try:
+            targets=[app/'claude.exe',app/'resources/app.asar',* (app/'resources/ion-dist/assets/v1').glob('*.js')]
+            for directory in {app.parent,*(path.parent for path in targets)}:
+                with tempfile.TemporaryFile(dir=directory): pass
+            for path in targets:
+                with path.open('r+b'): pass
+            backup.mkdir(parents=True,exist_ok=True)
+        except PermissionError as exc:
+            raise PermissionError('Claude installation is not writable. Run PowerShell as administrator with the same Windows user. WindowsApps may still deny writes; no application resources have been changed. Target: '+str(app)) from exc
     if args.restore:restore(app,backup);return
     inventory_path=backup/'inventory.json'
     inv=json.loads(inventory_path.read_text(encoding='utf8')) if inventory_path.exists() else {}
@@ -464,93 +412,13 @@ if __name__=='__main__':
         if ($CheckOnly) { $engineArgs += '--check-only' }
         if ($Restore) { $engineArgs += '--restore' }
         & $PythonPath @engineArgs
-        if ($LASTEXITCODE -ne 0) { throw 'Patch engine failed. No package registration was changed.' }
+        if ($LASTEXITCODE -ne 0) { throw 'Patch engine failed. See the diagnostic above.' }
     } finally {
         $env:PYTHONIOENCODING = $oldEncoding
         if (Test-Path -LiteralPath $tempScript) { Remove-Item -LiteralPath $tempScript -Force }
     }
     if ($CheckOnly -or $Restore) { return }
-
-    if ($Activate) {
-        $developer = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -ErrorAction SilentlyContinue
-        if (-not $developer -or -not $developer.PSObject.Properties['AllowDevelopmentWithoutDevLicense'] -or $developer.AllowDevelopmentWithoutDevLicense -ne 1) {
-            throw 'Patched files are ready. Enable Windows Developer Mode, then rerun with -PatchOnly -Activate. Current MSIX was not removed.'
-        }
-        if (-not $Yes) {
-            $answer = Read-Host 'Replace the current Claude package registration with the patched development layout? [y/N]'
-            if ($answer -notmatch '^[yY]$') { Info 'Patched copy kept. Current package registration was not changed.'; return }
-        }
-        # Finish all patching and checks before changing the active registration.
-        $registered = @(Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue)
-        $alreadyLoose = @($registered | Where-Object { $_.InstallLocation -eq $InstallDir })
-        if ($alreadyLoose.Count -eq 0) {
-            if ($registered.Count -gt 1) { throw 'Multiple Claude packages exist; resolve package ownership before activation.' }
-            # Packaged services require elevation even with Developer Mode on.
-            # Check before removing the current registration so failure is safe.
-            [xml]$activationManifest = Get-Content -LiteralPath (Join-Path $InstallDir 'AppxManifest.xml') -Raw
-            $serviceCapabilities = @($activationManifest.SelectNodes("//*[local-name()='Capability' and (@Name='localSystemServices' or @Name='packagedServices')]"))
-            $activationPrincipal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
-            if ($serviceCapabilities.Count -gt 0 -and -not $activationPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-                throw 'This Claude package contains Windows services. Run PowerShell as administrator for activation. Patched files are ready; current registration has not been removed.'
-            }
-            $activationBackup = Join-Path $InstallDir ('registration-backup\' + [Guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $activationBackup -Force | Out-Null
-            $previous = @()
-            foreach ($pkg in $registered) {
-                Stop-TargetClaude (Join-Path $pkg.InstallLocation 'app')
-                $originalCopy = Join-Path $activationBackup 'original-package'
-                New-Item -ItemType Directory -Path $originalCopy -Force | Out-Null
-                Info 'Backing up the previous application layout before activation'
-                Copy-DirectoryTree $pkg.InstallLocation $originalCopy
-                $snapshot = Join-Path $activationBackup 'user-data'
-                New-Item -ItemType Directory -Path $snapshot -Force | Out-Null
-                $currentData = Join-Path (Join-Path $env:LOCALAPPDATA 'Packages') $pkg.PackageFamilyName
-                foreach ($folder in @('LocalCache','LocalState','RoamingState','AppData')) {
-                    $dataFolder = Join-Path $currentData $folder
-                    if (Test-Path -LiteralPath $dataFolder) {
-                        Copy-DirectoryTree $dataFolder (Join-Path $snapshot $folder)
-                    }
-                }
-                $previous += [pscustomobject]@{PackageFullName=$pkg.PackageFullName;Family=$pkg.PackageFamilyName;OriginalLayout=$originalCopy;DataSnapshot=$snapshot}
-            }
-            $activation = [ordered]@{PreviousPackage=$previous;NewLayout=$InstallDir;At=(Get-Date).ToString('o')}
-            $activation | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $InstallDir 'activation-record.json') -Encoding UTF8
-            foreach ($pkg in $registered) {
-                Info "Removing current-user registration: $($pkg.PackageFullName)"
-                if ($pkg.IsDevelopmentMode) { Remove-AppxPackage -Package $pkg.PackageFullName -PreserveApplicationData }
-                else { Remove-AppxPackage -Package $pkg.PackageFullName }
-            }
-            try {
-                Add-AppxPackage -Register (Join-Path $InstallDir 'AppxManifest.xml') -ErrorAction Stop
-                foreach ($prior in $previous) { Restore-PackageData $prior.DataSnapshot $prior.Family }
-            }
-            catch {
-                $activationError = $_.Exception.Message
-                # If the new layout registered but data restoration failed,
-                # remove that registration before rolling back the layout.
-                Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue | Where-Object { $_.InstallLocation -eq $InstallDir } | ForEach-Object {
-                    Remove-AppxPackage -Package $_.PackageFullName -PreserveApplicationData
-                }
-                foreach ($old in $previous) {
-                    $oldManifest = Join-Path $old.OriginalLayout 'AppxManifest.xml'
-                    if (Test-Path -LiteralPath $oldManifest) {
-                        try { Add-AppxPackage -Register $oldManifest -ErrorAction Stop; Restore-PackageData $old.DataSnapshot $old.Family; Info 'Previous application layout and data restored.' }
-                        catch { Write-Warning 'Previous package files are unavailable or could not be registered. Reinstall the official package; see activation-record.json.' }
-                    } else { Write-Warning 'Previous package was removed by Windows. Reinstall the official package if needed.' }
-                }
-                throw "Development-layout registration failed: $activationError. Patched copy and resource backups remain."
-            }
-        }
-        if (-not $NoLaunch) {
-            $active = Get-AppxPackage -Name Claude | Where-Object { $_.InstallLocation -eq $InstallDir } | Select-Object -First 1
-            if (-not $active) { throw 'Patched package was not registered.' }
-            Start-Process ('shell:AppsFolder\' + $active.PackageFamilyName + '!Claude')
-        }
-        Info 'Activated. Restart Claude and create a new session for session settings to take effect.'
-    } else {
-        Info 'Patched copy is ready. Current installed Claude remains active.'
-        Info 'To activate: rerun this script with -PatchOnly -Activate (Developer Mode required).'
-    }
+    Info 'Current Claude installation patched. Start Claude and create a new session for session settings to take effect.'
     Info ('Restore resources: powershell -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Restore -InstallDir "' + $InstallDir + '"')
 } catch {
     Write-Error $_.Exception.Message
