@@ -521,6 +521,10 @@ def main():
         except PermissionError as exc:
             raise PermissionError('Claude installation is not writable. Run PowerShell as administrator with the same Windows user. WindowsApps may still deny writes; no application resources have been changed. Target: '+str(app)) from exc
     if args.restore:restore(app,backup);return
+    # Fingerprint of the patch engine itself: the repeat-run shortcut below may
+    # only trigger when the current engine would produce the same build, so an
+    # edited script can never be silently skipped.
+    engine_id=sha(pathlib.Path(__file__).read_bytes())
     inventory_path=backup/'inventory.json'
     inv=json.loads(inventory_path.read_text(encoding='utf8')) if inventory_path.exists() else {}
     if not args.check_only and not args.restore:
@@ -530,7 +534,7 @@ def main():
         if prev_path.exists():
             try: prev=json.loads(prev_path.read_text(encoding='utf8'))
             except Exception: prev={}
-        if prev and not prev.get('resourcesRestored') and prev.get('newHeaderSHA256'):
+        if prev and not prev.get('resourcesRestored') and prev.get('newHeaderSHA256') and prev.get('engineSHA256')==engine_id:
             if prev['newHeaderSHA256'].encode('ascii') in (app/'claude.exe').read_bytes():
                 log('Already patched: claude.exe already contains this patch build. Nothing to do.')
                 return
@@ -576,7 +580,8 @@ def main():
             'originalHeaderSHA256':old_hash,'newHeaderSHA256':new_hash,
             'asarSHA256':asar_sha256,'exeSHA256':sha(patched_exe),
             'signedExeSignatureInvalidated':True,'runtimeTested':False,'resourcesRestored':False,
-            'streamingBuild':True,'syntaxCheckSkipped':args.skip_syntax_check}
+            'streamingBuild':True,'syntaxCheckSkipped':args.skip_syntax_check,
+            'engineSHA256':engine_id}
         if args.check_only:
             log(json.dumps(report_obj,ensure_ascii=False,indent=2));log('CHECK ONLY: no application files changed.');return
         writes[exe_path]=patched_exe
