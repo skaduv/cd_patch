@@ -1,10 +1,9 @@
-﻿# Claude Desktop compatible builds: Gateway models + Simplified Chinese + CU/Browser.
+﻿# Claude Desktop compatible builds: Gateway models + CU/Browser.
 
 [CmdletBinding()]
 param(
     [string]$MsixPath = '',
     [string]$InstallDir = '',
-    [string]$LanguageDir = '',
     [string]$PythonPath = '',
     [string]$NodePath = '',
     [switch]$CheckOnly,
@@ -16,7 +15,6 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$SupportedVersion = '2.16120.0.0'
 function Info([string]$Message) { Write-Host ('==> ' + $Message) -ForegroundColor Cyan }
 function Resolve-Runtime([string]$Given,[string]$Name,[string[]]$Fallbacks) {
     if ($Given) { return (Resolve-Path -LiteralPath $Given).Path }
@@ -75,7 +73,6 @@ try {
     $InstallDir = [IO.Path]::GetFullPath($InstallDir)
     if ($InstallDir -match '(?i)\\WindowsApps(?:\\|$)') { throw 'Choose a directory outside WindowsApps.' }
     if ($InstallDir -eq [IO.Path]::GetPathRoot($InstallDir)) { throw 'InstallDir cannot be a drive root.' }
-    if ($LanguageDir) { $LanguageDir = (Resolve-Path -LiteralPath $LanguageDir).Path }
     $PythonPath = Resolve-Runtime $PythonPath 'python.exe' @(
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
     )
@@ -123,64 +120,13 @@ try {
 
     # Backend is embedded to keep the patch engine in a single PS1.
     $backend = @'
-"""Claude Desktop 2.16120.0.0 patch engine. Standard library only.
+"""Claude Desktop 2.31226.1.0 patch engine. Standard library only.
 
-Never operates on WindowsApps. PowerShell wrapper owns package registration.
+Never writes to WindowsApps. PowerShell wrapper owns package registration.
 """
 import argparse, copy, hashlib, json, os, pathlib, re, shutil, struct, subprocess, sys, tempfile, xml.etree.ElementTree as ET
 
-import urllib.request, urllib.error, http.client, time
-
-REPOSITORY = 'https://github.com/javaht/claude-desktop-zh-cn'
-LANGUAGE_FILES = {
-    'zh-CN.json': 'desktop-zh-CN.json',
-    'ion-dist/i18n/zh-CN.json': 'frontend-zh-CN.json',
-    'ion-dist/i18n/statsig/zh-CN.json': 'statsig-zh-CN.json',
-}
-
-def fetch_language(url):
-    request = urllib.request.Request(url, headers={'User-Agent':'ClaudeDesktop-language-pack'})
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read()
-        except (urllib.error.URLError, http.client.IncompleteRead, TimeoutError):
-            if attempt == 2: raise
-            time.sleep(attempt + 1)
-
-def read_catalog(data, label):
-    value = json.loads(data)
-    if not isinstance(value, dict) or not all(isinstance(k,str) and isinstance(v,str) for k,v in value.items()):
-        raise ValueError('Invalid language catalog: ' + label)
-    return value
-
-def merged_catalogs(resources, directory=None):
-    revision = None
-    if directory is None:
-        revision = json.loads(fetch_language('https://api.github.com/repos/javaht/claude-desktop-zh-cn/commits/main'))['sha']
-        if not re.fullmatch(r'[0-9a-f]{40}', revision): raise ValueError('Invalid upstream revision')
-    packs = {}
-    for target, source in LANGUAGE_FILES.items():
-        data = (directory/source).read_bytes() if directory is not None else fetch_language(
-            f'https://raw.githubusercontent.com/javaht/claude-desktop-zh-cn/{revision}/resources/{source}')
-        packs[target] = read_catalog(data, source)
-        if not packs[target]: raise ValueError('Empty upstream language catalog: ' + source)
-    result = {}
-    for target, translations in packs.items():
-        english = resources/target.replace('zh-CN','en-US')
-        if english.is_file():
-            baseline = read_catalog(english.read_bytes(), str(english))
-            result[target] = {k:translations.get(k,v) for k,v in baseline.items()}
-        else: result[target] = translations
-    dynamic = resources/'ion-dist/i18n/dynamic/en-US.json'
-    if dynamic.is_file():
-        baseline = read_catalog(dynamic.read_bytes(), str(dynamic))
-        translations = packs['ion-dist/i18n/zh-CN.json']
-        result['ion-dist/i18n/dynamic/zh-CN.json'] = {k:translations.get(k,v) for k,v in baseline.items()}
-    result['ion-dist/i18n/zh-CN.overrides.json'] = {}
-    return result, revision
-
-VERSION = '2.16120.0.0'
+VERSION = '2.31226.1.0'
 VALID_ID = r'typeof e==="string"&&e.trim().length>0&&!/[\x00-\x1f\x7f-\x9f]/.test(e)'
 
 def sha(b): return hashlib.sha256(b).hexdigest()
@@ -260,78 +206,105 @@ def patch_validator(text,label,report):
     return once(text,pat,repl,label,report)
 
 def patch_discovery_default(text,label,report):
-    pattern=r'(flatKey:"modelDiscoveryEnabled",support:\{enabled:\{scopes:\["3p"\],availableInVersion:"1\.8089\.0"\},executionTarget:"desktop"\},default:)\{displayOnly:!0\}'
+    pattern=r'(flatKey:"modelDiscoveryEnabled",readers:\["desktop","code"\],support:\{enabled:\{scopes:\["3p"\],availableInVersion:"1\.8089\.0"\},executionTarget:"desktop"\},default:)\{displayOnly:!0\}'
     return once(text,pattern,lambda m:m[1]+'!0',label,report)
 
 def patch_telemetry_defaults(text,label,report):
     for key in ['disableEssentialTelemetry','disableNonessentialTelemetry']:
-        pattern=r'(flatKey:"'+key+r'",support:\{enabled:\{scopes:\["3p"\],availableInVersion:"1\.2581\.0"\}\},remotePolicy:\{default:!0,applyUnverified:!0\},failClosedValue:!0,title:[^\n]*?,default:)!1(?=,category:"telemetry")'
+        pattern=r'(flatKey:"'+key+r'",readers:\["desktop","code"\],support:\{enabled:\{scopes:\["3p"\],availableInVersion:"1\.2581\.0"\}\},remotePolicy:\{default:!0,applyUnverified:!0\},failClosedValue:!0,title:[^\n]*?,default:)!1(?=,category:"telemetry")'
         text=once(text,pattern,lambda m:m[1]+'!0',label+' '+key+' default true',report)
-        scopes=r'(flatKey:"'+key+r'",support:\{enabled:\{scopes:)\["3p"\]'
+        scopes=r'(flatKey:"'+key+r'",readers:\["desktop","code"\],support:\{enabled:\{scopes:)\["3p"\]'
         text=once(text,scopes,lambda m:m[1]+'["3p","1p"]',label+' '+key+' support 1p',report)
     for key in ['toolSearchEnabled','skipWebFetchPreflight']:
-        pattern=r'(flatKey:"'+key+r'",support:\{enabled:\{scopes:\["3p"\],availableInVersion:"[^"]+"\},executionTarget:"desktop"\},title:[^\n]*?,default:)(?:!1|\{displayOnly:!1\})(?=,category:"sandbox")'
+        pattern=r'(flatKey:"'+key+r'",readers:\["desktop","code"\],support:\{enabled:\{scopes:\["3p"\],availableInVersion:"[^"]+"\},executionTarget:"desktop"\},title:[^\n]*?,default:)(?:!1|\{displayOnly:!1\})(?=,category:"sandbox")'
         text=once(text,pattern,lambda m:m[1]+'!0',label+' '+key+' default true',report)
-        pattern=r'(flatKey:"'+key+r'",support:\{enabled:\{scopes:)\["3p"\]'
+        pattern=r'(flatKey:"'+key+r'",readers:\["desktop","code"\],support:\{enabled:\{scopes:)\["3p"\]'
         text=once(text,pattern,lambda m:m[1]+'["3p","1p"]',label+' '+key+' support 1p',report)
     return text
 
+def patch_browser_default(text,label,report):
+    # Enable the local default, while preserving explicit false and org policy.
+    pattern=r'(flatKey:"builtinBrowserEnabled",support:\{enabled:\{scopes:\["3p"\],availableInVersion:"2\.2553\.0"\},executionTarget:"desktop"\},title:[^\n]*?,default:)!1(?=,remotePolicy:)'
+    return once(text,pattern,lambda m:m[1]+'!0',label+' browser default true',report)
+
+def patch_local_features(text,label,report):
+    # 2.31226 uses rule descriptors, shared by main and startup bundles.
+    # Browser rules still follow builtinBrowserEnabled and its policy check.
+    cu={'enabled':True,'batchOnly':False,'teachModeEnabled':True,
+        'clipboardPasteMultiline':True,'coordinateMode':'pixels',
+        'dispatchCuGrantTtlMs':1800000,'hideBeforeAction':True,
+        'mouseAnimation':True,'pixelValidation':True,'autoTargetDisplay':True,
+        'clipboardGuard':True,'maskFailClosed':True,'adaptiveResolution':True}
+    extra={str(key):{'rule':'forced','value':True} for key in (4293378213,36693946,40173473)}
+    extra['1291166712']={'rule':'forced','value':cu}
+    pattern=r'17519066:\{rule:"forcedFor",group:"builtinBrowser",value:!0\}'
+    return once(text,pattern,lambda m:dump(extra).decode()[1:-1]+','+m[0],
+        label+' CU local feature rules',report)
+
+def patch_effective_telemetry(text,label,report,startup=False):
+    # These accessors run after scope filtering and before Sentry startup.
+    # Leave third-party opt-outs intact; force both blocks for first-party mode.
+    name,reader,snapshot,predicate=('V1','B1','O1','i0') if startup else ('K','sUe','Vu','bu')
+    pattern=r'function '+name+r'\(e\)\{return '+reader+r'\('+snapshot+r'\(\),e\)\}'
+    replacement='function '+name+'(e){let t='+reader+'('+snapshot+'(),e);return '+predicate+'(t)?t:{...t,telemetry:{...t.telemetry,disableEssential:!0,disableNonessential:!0}}}'
+    return once(text,pattern,replacement,label+' 1p effective telemetry disabled',report)
+
+def patch_offline_menu(text,report):
+    # Reserve a local title-bar strip above the remote WebContentsView. A DOM
+    # z-index alone cannot put the shell button above a native child view.
+    old='y.setBounds({x:0,y:0,width:t.width,height:t.height-0}),n.width!==t.width||n.height!==t.height-0'
+    new='y.setBounds({x:0,y:40,width:t.width,height:Math.max(0,t.height-40)}),n.y!==40||n.width!==t.width||n.height!==Math.max(0,t.height-40)'
+    text=once(text,re.escape(old),lambda m:new,'persistent local menu viewport',report)
+    old='submenu:[tpi(),...npi(),...rpi(),...Kfi(),'
+    new='submenu:[{label:X().formatMessage({defaultMessage:"Configure Third-Party Inference\\u2026",id:"9GRz7bC+rr"}),click:()=>ega()},tpi(),...npi(),...rpi(),...Kfi(),'
+    return once(text,re.escape(old),lambda m:new,'local third-party setup menu entry',report)
+
+def patch_window_menu(text,report):
+    old='n&&(0,m.jsxs)(m.Fragment,{children:[(0,m.jsx)("div",{className:"nc-no-drag absolute top-2 left-2 z-[60]"'
+    new='(0,m.jsxs)(m.Fragment,{children:[(0,m.jsx)("div",{className:"nc-no-drag absolute top-1 left-2 z-[60]"'
+    text=once(text,re.escape(old),lambda m:new,'local menu visible without load error',report)
+    text=once(text,re.escape('onMouseDown:n.offlineGame?'),lambda m:'onMouseDown:n?.offlineGame?',
+        'local menu handles absent load error',report)
+    text=once(text,re.escape('(0,m.jsx)(T,{details:n,onRefresh:D,onRestart:O})'),
+        lambda m:'n&&(0,m.jsx)(T,{details:n,onRefresh:D,onRestart:O})',
+        'load error overlay remains conditional',report)
+    return text
+
 def patch_main(text,report):
+    text=patch_offline_menu(text,report)
     text=patch_validator(text,'main gateway validator',report)
     text=patch_discovery_default(text,'main model discovery default true',report)
     text=patch_telemetry_defaults(text,'main',report)
-    text=once(text,r'if\(t\.type!=="3p"\|\|!e\.workspace\.toolSearchEnabled\)return"off";',
-        'if(!e.workspace.toolSearchEnabled)return"off";', 'tool search enabled for 1p and 3p sessions',report)
-    text=once(text,r'\.\.\.W\(\)\.type==="3p"&&K\(\)\.workspace\.skipWebFetchPreflight===!0&&\{skipWebFetchPreflight:!0\}',
-        '...K().workspace.skipWebFetchPreflight===!0&&{skipWebFetchPreflight:!0}',
+    text=patch_browser_default(text,'main',report)
+    # Keep provider compatibility detection (unpinned), and use host tool search
+    # for 1p instead of the legacy third-party beta-header path.
+    text=once(text,r'!t\.thirdParty\|\|!e\.workspace\.toolSearchEnabled\?"off":e\.inference\?\.provider==="gateway"',
+        '!e.workspace.toolSearchEnabled?"off":!t.thirdParty?"host":e.inference?.provider==="gateway"',
+        'tool search enabled for 1p and 3p sessions',report)
+    text=once(text,r'\.\.\.t\.thirdParty&&e\.workspace\.skipWebFetchPreflight===!0&&\{skipWebFetchPreflight:!0\}',
+        '...e.workspace.skipWebFetchPreflight===!0&&{skipWebFetchPreflight:!0}',
         'WebFetch skip preflight passed to 1p and 3p sessions',report)
-    text=once(text,r'function K\(e\)\{return pHe\(dd\(\),e\)\}',
-        'function K(e){let t=pHe(dd(),e);return Wu(t)?t:{...t,telemetry:{...t.telemetry,disableEssential:!0,disableNonessential:!0}}}',
-        '1p main effective telemetry forced disabled',report)
-    text=once(text,r'\.\.\.r&&\{DISABLE_GROWTHBOOK:"1",CLAUDE_CODE_MODEL_CATALOG:"0",DISABLE_TELEMETRY:',
-        'DISABLE_TELEMETRY:"1",DISABLE_ERROR_REPORTING:"1",...r&&{DISABLE_GROWTHBOOK:"1",CLAUDE_CODE_MODEL_CATALOG:"0",DISABLE_TELEMETRY:',
-        '1p Code subprocess error and usage reporting disabled',report)
-    text=once(text,r'return!Bo\(t\.id\)&&!n\?\[\]:\[',
+    text=patch_effective_telemetry(text,'main',report)
+    text=once(text,r'\.\.\.r&&\{DISABLE_GROWTHBOOK:"1",',
+        '...!r&&{DISABLE_TELEMETRY:"1",DISABLE_ERROR_REPORTING:"1",ENABLE_TOOL_SEARCH:c==="host"?"force":"false"},...r&&{DISABLE_GROWTHBOOK:"1",',
+        '1p Code telemetry and host tool search environment',report)
+    text=once(text,r'return!So\(t\.id\)&&!n\?\[\]:\[',
         lambda m:'return!('+re.sub(r'\be\b','t.id',VALID_ID)+')?[]:[',
         'gateway discovery filter',report)
-    # Do not group/rename opaque third-party IDs by inferred Claude family.
-    text=once(text,r'\{ok:!0,models:GHt\(WHt\(c\)\),\.\.\.d&&\{partial:!0\}\}',
+    text=once(text,r'\{ok:!0,models:T2t\(w2t\(c\)\),\.\.\.d&&\{partial:!0\}\}',
         '{ok:!0,models:Array.from(new Map(c.map(e=>[e.id,e])).values()),...d&&{partial:!0}}',
         'gateway discovery deduplication',report)
-    text=once(text,r'adminListObviatesDiscovery\(\)\{let e=this\.creds\.models;return!!e\?\.length&&!e\.some\(\(e=>SQt\.some\(\(t=>t===e\.name\.toLowerCase\(\)\)\)\)\)\}',
+    text=once(text,r'adminListObviatesDiscovery\(\)\{let e=this\.creds\.models;return!!e\?\.length&&!e\.some\(\(e=>xtn\.some\(\(t=>t===e\.name\.toLowerCase\(\)\)\)\)\)\}',
         'adminListObviatesDiscovery(){return!1}', 'gateway discover with manual list',report)
     text=once(text,r'else a=r\?\?\[\];return i&&',
         'else a=r??[];if((e==="gateway"||e==="mantle")&&r?.length){let t=new Set(a.map(e=>e.id));a=[...a,...r.filter(e=>!t.has(e.id))]}return i&&',
         'gateway merge configured and discovered models',report)
-    # Preserve explicit discoveryEnabled:false and all existing credentials/policies.
-    # User-configured false remains a meaningful opt-out.
-    cu={'enabled':True,'batchOnly':False,'teachModeEnabled':True,'clipboardPasteMultiline':True,
-        'coordinateMode':'pixels','dispatchCuGrantTtlMs':1800000,'hideBeforeAction':True,
-        'mouseAnimation':True,'pixelValidation':True,'screenshotFilter':True}
-    def features(m):
-        g=m[1]
-        cfg='{value:'+dump(cu).decode()+',on:true,off:false,source:"force",experiment:null,experimentResult:null}'
-        return '{17519066:'+g+',3990395613:'+g+',4293378213:'+g+',36693946:'+g+',40173473:'+g+',1291166712:'+cfg+'}'
-    text=once(text,r'\{17519066:([\w$]+),3990395613:\1\}',features,'CU/browser local feature table',report)
-    pat=r'function ([\w$]+)\((\w)\)\{return \2\.selfHostedSessions\?\2\.builtinBrowserEnabled\?([\w$]+):([\w$]+):\2\.builtinBrowserEnabled\?([\w$]+):([\w$]+)\}'
-    text=once(text,pat,lambda m:'function '+m[1]+'('+m[2]+'){return '+m[2]+'.selfHostedSessions?'+m[3]+':'+m[5]+'}',
-        'browser feature selector',report)
-    pat=r'\.\.\.\w+\.builtinBrowserEnabled&&\{4112513247:([\w$]+)\(!0\)\}'
-    text=once(text,pat,lambda m:'...!0&&{4112513247:'+m[1]+'(!0),745998442:'+m[1]+'(!0),709117870:'+m[1]+'(!0)}',
-        'browser session feature table',report)
-    text=once(text,r'builtinBrowserEnabled:this\.builtinBrowserEnabled\(\)',
-        'builtinBrowserEnabled:!0','browser buildConfig',report,count=2)
-    # Do not replace org-block checks, grant checks, or admission/paid-plan checks.
-    # dramatic_shrimp is only the local 3p availability descriptor, as in reference.
+    text=patch_local_features(text,'main',report)
     text=once(text,r'dramatic_shrimp:void 0','dramatic_shrimp:"available"',
         'local 3p remote-tools availability',report)
-    # Native browser getter still runs its existing SM() policy check.
-    # Unlike the reference P6, do not force the getter true past organization policy.
+    # Native browser getter, CU org/HIPAA gates, OS permissions, grants and
+    # network policies are deliberately retained.
     return text
-
-def patch_language_list(text,label,report):
-    pattern=r'\["en-US","de-DE","fr-FR","ko-KR","ja-JP","es-419","es-ES","it-IT","hi-IN","pt-BR","id-ID"\]'
-    return once(text,pattern,lambda m:m[0][:-1]+',"zh-CN"]',label,report,count=2)
 
 def backup_file(app,path,backup,inventory):
     rel=path.relative_to(app).as_posix()
@@ -378,17 +351,19 @@ def restore(app,backup):
     log('Original application resources restored. User data was not changed.')
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--app',required=True);p.add_argument('--language',default='')
+    p=argparse.ArgumentParser();p.add_argument('--app',required=True)
     p.add_argument('--node',required=True);p.add_argument('--check-only',action='store_true');p.add_argument('--restore',action='store_true')
-    args=p.parse_args();app=pathlib.Path(args.app).resolve();language=pathlib.Path(args.language)
+    args=p.parse_args();app=pathlib.Path(args.app).resolve()
     if 'windowsapps' in str(app).lower() and not args.check_only: raise ValueError('Refusing to modify WindowsApps')
     if not (app/'resources/app.asar').is_file():raise ValueError('Not a Claude app directory')
     manifest=app.parent/'AppxManifest.xml'
-    detected_version=VERSION
+    detected_version='unknown'
     if manifest.exists():
         identity=ET.parse(manifest).getroot().find('{*}Identity')
         detected_version=identity.attrib['Version']
         if not re.fullmatch(r'\d+\.\d+\.\d+\.\d+',detected_version): raise ValueError('Invalid package version')
+    if not args.restore and detected_version!=VERSION:
+        raise ValueError(f'Unsupported Claude version: {detected_version}; expected {VERSION}. No application files changed.')
     backup=app.parent/'patch-backup'
     legacy_backup=app.parent/('patch-backup-'+detected_version)
     if not backup.exists() and legacy_backup.exists():
@@ -406,26 +381,18 @@ def main():
     if len(main_names)!=1:raise ValueError('Main bundle does not match supported build')
     main_name=main_names[0]
     changes[main_name]=patch_main(files[main_name][1].decode('utf8'),report).encode('utf8')
+    window_names=[n for n,(e,b) in files.items() if '/main_window/' in n and n.endswith('.js') and b'function A(){' in b and b'requestMainMenuPopup' in b]
+    if len(window_names)!=1:raise ValueError('Cannot uniquely identify local window menu; no files changed')
+    window_name=window_names[0]
+    changes[window_name]=patch_window_menu(files[window_name][1].decode('utf8'),report).encode('utf8')
     pre='.vite/build/index.pre.js'
     pre_text=patch_validator(files[pre][1].decode('utf8'),'preload gateway validator',report)
     pre_text=patch_discovery_default(pre_text,'preload model discovery default true',report)
     pre_text=patch_telemetry_defaults(pre_text,'preload',report)
-    pre_text=once(pre_text,r'function x\$\(e\)\{return b\$\(l\$\(\),e\)\}',
-        'function x$(e){let t=b$(l$(),e);return R$(t)?t:{...t,telemetry:{...t.telemetry,disableEssential:!0,disableNonessential:!0}}}',
-        '1p startup config telemetry forced disabled before Sentry init',report)
+    pre_text=patch_browser_default(pre_text,'preload',report)
+    pre_text=patch_local_features(pre_text,'preload',report)
+    pre_text=patch_effective_telemetry(pre_text,'preload',report,startup=True)
     changes[pre]=pre_text.encode('utf8')
-    # Native locale availability may use the frontend's negotiated locale; ensure
-    # any explicit native supported-locale literals are extended when present.
-    native_locale_changes=0
-    locale_lit=r'\["en-US","de-DE","fr-FR","ko-KR","ja-JP","es-419","es-ES","it-IT","hi-IN","pt-BR","id-ID"\]'
-    for n,(e,b) in files.items():
-        if not n.endswith('.js'):continue
-        t=changes.get(n,b).decode('utf8')
-        hits=len(re.findall(locale_lit,t))
-        if hits:
-            changes[n]=re.sub(locale_lit,lambda m:m[0][:-1]+',"zh-CN"]',t).encode('utf8')
-            native_locale_changes+=hits
-    report.append({'patch':'native supported locale literals','matches':native_locale_changes})
     writes={}
     assets=app/'resources/ion-dist/assets/v1'
     def pristine(path):
@@ -433,21 +400,11 @@ def main():
         return (b if b.exists() else path).read_text(encoding='utf8')
     asset_texts={p:pristine(p) for p in assets.glob('*.js')}
     front=[p for p,t in asset_texts.items() if 'flatKey:"modelDiscoveryEnabled"' in t and 'flatKey:"disableEssentialTelemetry"' in t]
-    shared=[p for p,t in asset_texts.items() if re.search(locale_lit,t)]
-    names=[p for p,t in asset_texts.items() if '"en-US":{name:"English (United States)",localName:"English (United States)"}' in t]
-    if len(front)!=1 or len(shared)!=1 or len(names)!=1:raise ValueError('Cannot uniquely identify compatible frontend structures; no files changed')
+    if len(front)!=1:raise ValueError('Cannot uniquely identify compatible frontend structures; no files changed')
     front_text=patch_validator(pristine(front[0]),'frontend gateway validator',report)
     front_text=patch_discovery_default(front_text,'frontend model discovery default true',report)
-    writes[front[0]]=patch_telemetry_defaults(front_text,'frontend',report).encode('utf8')
-    writes[shared[0]]=patch_language_list(pristine(shared[0]),'frontend supported locales',report).encode('utf8')
-    writes[names[0]]=once(pristine(names[0]),r'"en-US":\{name:"English \(United States\)",localName:"English \(United States\)"\}',
-        '"zh-CN":{name:"Chinese (Simplified)",localName:"简体中文"},"en-US":{name:"English (United States)",localName:"English (United States)"}',
-        'language menu',report).encode('utf8')
-    language_report={}
-    packs, revision = merged_catalogs(app/'resources', language if args.language else None)
-    for target, pack in packs.items():
-        writes[app/'resources'/target]=dump(pack)
-        language_report[target]={'keys':len(pack),'withChinese':sum(bool(re.search(r'[\u3400-\u9fff]',x)) for x in pack.values())}
+    front_text=patch_telemetry_defaults(front_text,'frontend',report)
+    writes[front[0]]=patch_browser_default(front_text,'frontend',report).encode('utf8')
     new_asar,new_hash=build_asar(hdr,files,changes)
     exe_path=app/'claude.exe';bexe=backup/'files/claude.exe'
     exe=(bexe if bexe.exists() else exe_path).read_bytes()
@@ -460,7 +417,7 @@ def main():
         for path,b in writes.items():
             if path.suffix=='.js':syntax_check(args.node,b,td,path.name)
         test_asar=td/'app.asar';test_asar.write_bytes(new_asar);validate_asar(test_asar)
-    report_obj={'detectedVersion':detected_version,'testedBaselineVersion':VERSION,'compatibilityMode':'structure-checked','patches':report,'language':language_report,'languageSource':REPOSITORY,'languageRevision':revision,
+    report_obj={'detectedVersion':detected_version,'testedBaselineVersion':VERSION,'compatibilityMode':'structure-checked','patches':report,
         'originalHeaderSHA256':old_hash,'newHeaderSHA256':new_hash,
         'asarSHA256':sha(new_asar),'exeSHA256':sha(patched_exe),
         'signedExeSignatureInvalidated':True,'runtimeTested':False,'resourcesRestored':False}
@@ -474,16 +431,22 @@ def main():
             raise ValueError('Backup verification failed before modification: '+rel)
     log('Pre-modification backup verified: '+str(backup))
     # Prepare all files before replacing any originals. Roll back the full set
-    # on any failed write, including external JS and language catalogs.
+    # on any failed write, including external JS.
+    staged=[]
     try:
         for path,data in writes.items():
             path.parent.mkdir(parents=True,exist_ok=True)
-            temp=path.with_name(path.name+'.patch-tmp');temp.write_bytes(data);os.replace(temp,path)
+            with tempfile.NamedTemporaryFile(dir=path.parent,prefix=path.name+'.patch-',delete=False) as handle:
+                temp=pathlib.Path(handle.name);staged.append((temp,path));handle.write(data)
+        for temp,path in staged:os.replace(temp,path)
         validate_asar(app/'resources/app.asar')
         if new_hash.encode() not in exe_path.read_bytes():raise ValueError('EXE header hash verification failed')
         (app.parent/'patch-report.json').write_bytes(dump(report_obj))
     except BaseException:
         restore(app,backup);raise
+    finally:
+        for temp,path in staged:
+            if temp.exists():temp.unlink()
     log('Patch complete. Original executable signature is no longer valid; ASAR integrity is retained.')
     log('Backup: '+str(backup));log('Report: '+str(app.parent/'patch-report.json'))
 
@@ -498,7 +461,6 @@ if __name__=='__main__':
     try {
         $env:PYTHONIOENCODING = 'utf-8'
         $engineArgs = @($tempScript,'--app',$AppDir,'--node',$NodePath)
-        if ($LanguageDir) { $engineArgs += @('--language',$LanguageDir) }
         if ($CheckOnly) { $engineArgs += '--check-only' }
         if ($Restore) { $engineArgs += '--restore' }
         & $PythonPath @engineArgs
@@ -523,6 +485,14 @@ if __name__=='__main__':
         $alreadyLoose = @($registered | Where-Object { $_.InstallLocation -eq $InstallDir })
         if ($alreadyLoose.Count -eq 0) {
             if ($registered.Count -gt 1) { throw 'Multiple Claude packages exist; resolve package ownership before activation.' }
+            # Packaged services require elevation even with Developer Mode on.
+            # Check before removing the current registration so failure is safe.
+            [xml]$activationManifest = Get-Content -LiteralPath (Join-Path $InstallDir 'AppxManifest.xml') -Raw
+            $serviceCapabilities = @($activationManifest.SelectNodes("//*[local-name()='Capability' and (@Name='localSystemServices' or @Name='packagedServices')]"))
+            $activationPrincipal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+            if ($serviceCapabilities.Count -gt 0 -and -not $activationPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+                throw 'This Claude package contains Windows services. Run PowerShell as administrator for activation. Patched files are ready; current registration has not been removed.'
+            }
             $activationBackup = Join-Path $InstallDir ('registration-backup\' + [Guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $activationBackup -Force | Out-Null
             $previous = @()
@@ -576,7 +546,7 @@ if __name__=='__main__':
             if (-not $active) { throw 'Patched package was not registered.' }
             Start-Process ('shell:AppsFolder\' + $active.PackageFamilyName + '!Claude')
         }
-        Info 'Activated. Select 简体中文 in Claude Settings / Language.'
+        Info 'Activated. Restart Claude and create a new session for session settings to take effect.'
     } else {
         Info 'Patched copy is ready. Current installed Claude remains active.'
         Info 'To activate: rerun this script with -PatchOnly -Activate (Developer Mode required).'
