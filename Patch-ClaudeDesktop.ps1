@@ -787,11 +787,19 @@ def patch_effective_telemetry(text,label,report,startup=False):
     return once(text,pattern,replacement,label+' 1p effective telemetry disabled',report)
 
 def patch_offline_menu(text,report):
-    # Reserve a local title-bar strip above the remote WebContentsView. A DOM
-    # z-index alone cannot put the shell button above a native child view.
-    old='y.setBounds({x:0,y:0,width:t.width,height:t.height-0}),n.width!==t.width||n.height!==t.height-0'
-    new='y.setBounds({x:0,y:40,width:t.width,height:Math.max(0,t.height-40)}),n.y!==40||n.width!==t.width||n.height!==Math.max(0,t.height-40)'
-    text=once(text,re.escape(old),lambda m:new,'persistent local menu viewport',report)
+    # Reserve a 40px local title-bar strip above the remote WebContentsView only
+    # while it shows the region-unavailable page or a load error: a DOM z-index
+    # alone cannot put the shell menu button above a native child view, but a
+    # permanent strip squeezes the normal app. Re-layout on every navigation.
+    old='y.setBounds({x:0,y:0,width:t.width,height:t.height-0}),n.width!==t.width||n.height!==t.height-0};if(g&&e.isMaximized===!0&&e.isFullScreen!==!0){'
+    new=('(h=>(y.setBounds({x:0,y:h,width:t.width,height:Math.max(0,t.height-h)}),'
+        'n.y!==h||n.width!==t.width||n.height!==Math.max(0,t.height-h)))'
+        '((u=>u.startsWith("chrome-error://")||u.includes("/app-unavailable-in-region")?40:0)'
+        '(y.webContents.isDestroyed()?"":y.webContents.getURL()))};'
+        'for(let e of["did-navigate","did-navigate-in-page","did-fail-load","dom-ready"])'
+        'y.webContents.on(e,(()=>{p.isDestroyed()||y.webContents.isDestroyed()||w()}));'
+        'if(g&&e.isMaximized===!0&&e.isFullScreen!==!0){')
+    text=once(text,re.escape(old),lambda m:new,'local menu strip only on region-unavailable or load-error page',report)
     old='submenu:[tpi(),...npi(),...rpi(),...Kfi(),'
     new='submenu:[{label:X().formatMessage({defaultMessage:"Configure Third-Party Inference\\u2026",id:"9GRz7bC+rr"}),click:()=>ega()},tpi(),...npi(),...rpi(),...Kfi(),'
     return once(text,re.escape(old),lambda m:new,'local third-party setup menu entry',report)
