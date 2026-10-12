@@ -634,7 +634,11 @@ def stream_build_asar(source, body_tmp_path, report, language=False):
     if not pre_hit:
         raise ValueError('Preload bundle not found: .vite/build/index.pre.js')
     if language:
-        report.append({'patch': 'native supported locale literals', 'matches': native_locale_hits})
+        # Optional by design: the main process may not carry its own locale list
+        # (the frontend list is required and checked separately). Report the count.
+        if not native_locale_hits:
+            log('NOTE: no supported-locale list found in the main process bundles; relying on the frontend list.')
+        report.append({'patch': 'native supported locale literals', 'matches': native_locale_hits, 'required': False})
     log(f'Source ASAR verified and rebuilt: {total} files')
     return {'header': new_hdr, 'old_header_hash': old_header_hash,
             'patched_texts': patched_texts, 'file_count': total}
@@ -923,6 +927,19 @@ def main():
     # changes nothing. English baselines come from the pre-patch backup when present.
     use_language=not args.no_language
     language_writes={};language_report={};language_revision=None
+    if not use_language:
+        # A previous run installed Chinese: its catalogs and locale-list edits are
+        # not rewritten by a -NoLanguage run, so require a clean restore first.
+        prev_lang=False
+        prev_report_path=app.parent/'patch-report.json'
+        if prev_report_path.exists():
+            try:
+                prev_report=json.loads(prev_report_path.read_text(encoding='utf8'))
+                prev_lang=bool(prev_report.get('language')) and not prev_report.get('resourcesRestored')
+            except Exception: prev_lang=False
+        leftover=[rel for rel,meta in inv.items() if not meta.get('existed') and 'zh-CN' in rel and (app/rel).exists()]
+        if prev_lang or leftover:
+            raise ValueError('Simplified Chinese from a previous patch is still installed. Run -Restore first, then patch again with -NoLanguage. No application files changed.')
     if use_language:
         resources=app/'resources'
         packs,language_revision=merged_catalogs(resources,pathlib.Path(args.language).resolve() if args.language else None)
@@ -1007,6 +1024,7 @@ def main():
                     'language menu',report).encode('utf8')
             else:
                 display_assets=[p for p in asset_texts if 'Intl.DisplayNames' in asset_texts[p]]
+                if not display_assets:raise ValueError('Cannot find the language name table or Intl.DisplayNames in the frontend; no files changed')
                 for path in display_assets:
                     writes[path]=(current(path)+DISPLAY_NAME_PATCH).encode('utf8')
                 report.append({'patch':'language menu (Intl.DisplayNames fallback)','files':len(display_assets)})
