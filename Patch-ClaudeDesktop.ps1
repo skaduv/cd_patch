@@ -7,7 +7,9 @@ param(
     [string]$NodePath = '',
     [switch]$CheckOnly,
     [Alias('RestoreOriginal')][switch]$Restore,
-    [switch]$SkipSyntaxCheck
+    [switch]$SkipSyntaxCheck,
+    [switch]$NoAclChange,
+    [switch]$ElevatedChild
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -92,6 +94,229 @@ function Stop-TargetClaude([string]$TargetApp) {
         Start-Sleep -Milliseconds 800
     }
 }
+function Test-IsAdmin {
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function ConvertTo-QuotedArgument([string]$Value) {
+    # Windows command-line quoting: escape embedded quotes and double any
+    # backslashes that precede a quote, so values such as 'C:\' survive intact.
+    $escaped = [regex]::Replace($Value,'(\\*)"',{ param($m) ($m.Groups[1].Value * 2) + '\"' })
+    $escaped = [regex]::Replace($escaped,'(\\+)$',{ param($m) $m.Groups[1].Value * 2 })
+    return '"' + $escaped + '"'
+}
+function Invoke-SelfElevated([System.Collections.IDictionary]$Bound) {
+    # Relaunch this script elevated with the same arguments and wait for it.
+    # The elevated run keeps its own window open at the end so its output can be read.
+    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $PSCommandPath + '"'))
+    foreach ($key in @($Bound.Keys)) {
+        if ($key -eq 'ElevatedChild') { continue }
+        $value = $Bound[$key]
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) { $argList += ('-' + $key) }
+        } else {
+            $argList += ('-' + $key)
+            $argList += (ConvertTo-QuotedArgument ([string]$value))
+        }
+    }
+    $argList += '-ElevatedChild'
+    $hostExe = (Get-Process -Id $PID).Path
+    Info 'Administrator rights are required. Approve the UAC prompt; output continues in the new window.'
+    try {
+        $proc = Start-Process -FilePath $hostExe -ArgumentList $argList -Verb RunAs -Wait -PassThru -ErrorAction Stop
+    } catch {
+        throw 'Elevation was cancelled or failed. Run PowerShell as administrator and retry.'
+    }
+    return $proc.ExitCode
+}
+function Get-NormalizedRoot([string]$Root) {
+    return [IO.Path]::GetFullPath($Root).TrimEnd('\').ToLowerInvariant()
+}
+function Get-AclBackupPath([string]$Root) {
+    # Bind the backup to the normalized full install path: the file name carries a
+    # hash of it, and a sidecar '.path' file records it for verification.
+    $norm = Get-NormalizedRoot $Root
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($norm))[0..7] | ForEach-Object { $_.ToString('x2') }) }
+    finally { $sha.Dispose() }
+    $dir = Join-Path $env:LOCALAPPDATA 'ClaudeDesktopPatch'
+    return Join-Path $dir ('acl-' + (Split-Path $Root -Leaf) + '-' + $hash + '.txt')
+}
+function Get-FileSha256([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+function Write-AclBackupBinding([string]$Root,[string]$AclBackup) {
+    # Sidecar '.path': line 1 the normalized install path, line 2 the SHA256 of the
+    # DACL save file, line 3 the SHA256 of the per-item owner list.
+    $text = (Get-NormalizedRoot $Root) + "`n" + (Get-FileSha256 $AclBackup) + "`n" + (Get-FileSha256 ($AclBackup + '.owners')) + "`n"
+    [IO.File]::WriteAllText($AclBackup + '.path',$text,[Text.UTF8Encoding]::new($false))
+}
+function Assert-AclBackupBinding([string]$Root,[string]$AclBackup) {
+    $bindingPath = $AclBackup + '.path'
+    $ownersPath = $AclBackup + '.owners'
+    if (-not (Test-Path -LiteralPath $bindingPath -PathType Leaf)) { throw "ACL backup has no path binding: $AclBackup" }
+    if (-not (Test-Path -LiteralPath $ownersPath -PathType Leaf)) { throw "ACL backup has no owner list: $ownersPath" }
+    $binding = @([IO.File]::ReadAllLines($bindingPath,[Text.Encoding]::UTF8) | ForEach-Object { $_.Trim() })
+    if ($binding.Count -lt 3) { throw "ACL backup binding is incomplete: $bindingPath" }
+    if ($binding[0] -ne (Get-NormalizedRoot $Root)) { throw "ACL backup $AclBackup belongs to '$($binding[0])', not '$Root'." }
+    if ((Get-FileSha256 $AclBackup) -ne $binding[1] -or (Get-FileSha256 $ownersPath) -ne $binding[2]) {
+        throw "ACL backup $AclBackup failed its integrity check (contents changed since it was saved)."
+    }
+}
+function Save-InstallOwners([string]$Root,[string]$OwnersPath) {
+    # icacls /save keeps only DACLs, so record every item's original owner.
+    $items = @(Get-Item -LiteralPath $Root -Force) + @(Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction Stop)
+    $lines = foreach ($item in $items) {
+        $owner = (Get-Acl -LiteralPath $item.FullName -ErrorAction Stop).Owner
+        if (-not $owner) { throw "Cannot read the owner of $($item.FullName)." }
+        $rel = $item.FullName.Substring($Root.TrimEnd('\').Length).TrimStart('\')
+        $owner + "`t" + $rel
+    }
+    [IO.File]::WriteAllLines($OwnersPath,[string[]]$lines,[Text.UTF8Encoding]::new($false))
+}
+function ConvertTo-IcaclsAccount([string]$Owner) {
+    if ($Owner -match '^S-1-') { return '*' + $Owner }
+    return $Owner
+}
+function Resolve-ContainedPath([string]$Root,[string]$Relative) {
+    # Map a backup-relative path to a full path that must stay inside $Root and
+    # must not pass through a reparse point (junction/symlink). Returns $null if not.
+    if ($Relative -match '(^|[\\/])\.\.([\\/]|$)' -or $Relative -match ':' -or $Relative.StartsWith('\') -or $Relative.StartsWith('/')) { return $null }
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $full = if ($Relative) { [IO.Path]::GetFullPath((Join-Path $rootFull $Relative)) } else { $rootFull }
+    if ($full -ne $rootFull -and -not $full.StartsWith($rootFull + '\',[StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $cursor = $full
+    while ($cursor.Length -ge $rootFull.Length) {
+        if (Test-Path -LiteralPath $cursor) {
+            $attrs = (Get-Item -LiteralPath $cursor -Force).Attributes
+            if ($attrs -band [IO.FileAttributes]::ReparsePoint) { return $null }
+        }
+        if ($cursor -eq $rootFull) { break }
+        $cursor = Split-Path $cursor -Parent
+    }
+    return $full
+}
+function Test-AclSaveFilePaths([string]$Root,[string]$AclBackup) {
+    # icacls /restore applies paths relative to the parent folder; every entry must
+    # name this install folder or something beneath it.
+    $leaf = Split-Path $Root -Leaf
+    $lines = @([IO.File]::ReadAllLines($AclBackup,[Text.Encoding]::Unicode) | Where-Object { $_.Trim() })
+    for ($i = 0; $i -lt $lines.Count; $i += 2) {
+        $path = $lines[$i].Trim()
+        if ($path -ne $leaf -and -not $path.StartsWith($leaf + '\',[StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if (-not (Resolve-ContainedPath $Root $path.Substring($leaf.Length).TrimStart('\'))) { return $false }
+    }
+    return $true
+}
+function Restore-InstallOwners([string]$Root,[string]$OwnersPath) {
+    # Restore owners only for the items recorded before the first permission change;
+    # items created later (for example patch-backup) keep their current owner.
+    $entries = @([IO.File]::ReadAllLines($OwnersPath,[Text.Encoding]::UTF8) | Where-Object { $_ } | ForEach-Object {
+        $parts = $_.Split("`t",2); [pscustomobject]@{ Owner = $parts[0]; Path = $(if ($parts.Count -gt 1) { $parts[1] } else { '' }) }
+    })
+    if ($entries.Count -eq 0) { return 1 }
+    $result = 0
+    foreach ($entry in $entries) {
+        $full = Resolve-ContainedPath $Root $entry.Path
+        if (-not $full) { Write-Host "ERROR: Owner list entry outside the install folder rejected: $($entry.Path)" -ForegroundColor Red; $result = 1; continue }
+        if (-not (Test-Path -LiteralPath $full)) { continue }
+        & icacls.exe $full /setowner (ConvertTo-IcaclsAccount $entry.Owner) /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { $result = $LASTEXITCODE }
+    }
+    return $result
+}
+function Test-InstallWritable([string]$Root,[string]$App) {
+    $dirs = @($Root,$App,(Join-Path $App 'resources'),(Join-Path $App 'resources\ion-dist\assets\v1'))
+    foreach ($dir in $dirs) {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        $probe = Join-Path $dir ('.claude-patch-probe-' + [Guid]::NewGuid().ToString('N'))
+        try {
+            ([IO.File]::Open($probe,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)).Dispose()
+            Remove-Item -LiteralPath $probe -Force
+        } catch { return $false }
+    }
+    # Every existing file the engine may rewrite: exe, asar and the frontend JS assets.
+    $files = @((Join-Path $App 'claude.exe'),(Join-Path $App 'resources\app.asar'))
+    $assetDir = Join-Path $App 'resources\ion-dist\assets\v1'
+    if (Test-Path -LiteralPath $assetDir -PathType Container) {
+        $files += @(Get-ChildItem -LiteralPath $assetDir -Filter '*.js' -File -Force | ForEach-Object { $_.FullName })
+    }
+    foreach ($file in $files) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+        try { ([IO.File]::Open($file,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)).Dispose() }
+        catch { return $false }
+    }
+    return $true
+}
+function Grant-InstallWriteAccess([string]$Root) {
+    # WindowsApps package folders are owned by TrustedInstaller and Administrators
+    # only get read/execute, so elevation alone cannot write them. Save the
+    # original DACL once (kept across re-runs), then take ownership for
+    # Administrators and grant Administrators + the current user full control.
+    $aclBackup = Get-AclBackupPath $Root
+    if (Test-Path -LiteralPath $aclBackup -PathType Leaf) {
+        # Reuse only a backup that still matches this directory and its recorded
+        # checksums; otherwise stop before any permission change.
+        Assert-AclBackupBinding $Root $aclBackup
+    } else {
+        New-Item -ItemType Directory -Force -Path (Split-Path $aclBackup -Parent) | Out-Null
+        Info "Saving original ACL to $aclBackup"
+        # No /C: icacls stops at the first item it cannot read, so exit 0 means every item was saved.
+        & icacls.exe $Root /save $aclBackup /T /Q | Out-Null
+        $saveExit = $LASTEXITCODE
+        $saved = 0
+        if (Test-Path -LiteralPath $aclBackup -PathType Leaf) {
+            # The save file is UTF-16LE: one line with the item path, one with its SDDL.
+            $lines = @([IO.File]::ReadAllLines($aclBackup,[Text.Encoding]::Unicode) | Where-Object { $_.Trim() })
+            $saved = [int][Math]::Floor($lines.Count / 2)
+        }
+        $expected = 1 + @(Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction Stop).Count
+        if ($saveExit -ne 0 -or $saved -lt $expected) {
+            if (Test-Path -LiteralPath $aclBackup) { Remove-Item -LiteralPath $aclBackup -Force }
+            throw "Could not save a complete ACL backup (icacls exit $saveExit, saved $saved of $expected items); no permissions were changed."
+        }
+        try {
+            Save-InstallOwners $Root ($aclBackup + '.owners')
+            Write-AclBackupBinding $Root $aclBackup
+        } catch {
+            foreach ($f in @($aclBackup,($aclBackup + '.owners'),($aclBackup + '.path'))) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+            throw ('Could not save the original owners: ' + $_.Exception.Message + ' No permissions were changed.')
+        }
+    }
+    # Set before any ownership/ACL change (also when the backup already existed),
+    # so a failed patch always reverts the permissions this run changed.
+    $script:AclGrantedThisRun = $true
+    Info 'Taking ownership of the Claude installation for Administrators...'
+    & takeown.exe /F $Root /A /R /D Y | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "takeown failed (exit $LASTEXITCODE). Original ACL backup: $aclBackup" }
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Info 'Granting write access to Administrators and the current user...'
+    & icacls.exe $Root /grant '*S-1-5-32-544:(OI)(CI)F' ('*' + $me + ':(OI)(CI)F') /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls /grant failed (exit $LASTEXITCODE). Original ACL backup: $aclBackup" }
+}
+function Restore-InstallAcl([string]$Root) {
+    $aclBackup = Get-AclBackupPath $Root
+    if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { return $true }
+    try { Assert-AclBackupBinding $Root $aclBackup }
+    catch { Write-Host ('ERROR: ' + $_.Exception.Message + ' Permissions were not restored.') -ForegroundColor Red; return $false }
+    if (-not (Test-AclSaveFilePaths $Root $aclBackup)) {
+        Write-Host "ERROR: ACL backup $aclBackup lists paths outside the install folder. Permissions were not restored." -ForegroundColor Red
+        return $false
+    }
+    Info 'Restoring original ACL and per-item ownership...'
+    & icacls.exe (Split-Path $Root -Parent) /restore $aclBackup /C /Q | Out-Null
+    $restoreExit = $LASTEXITCODE
+    $ownerExit = Restore-InstallOwners $Root ($aclBackup + '.owners')
+    if ($restoreExit -eq 0 -and $ownerExit -eq 0) {
+        Remove-Item -LiteralPath $aclBackup -Force
+        Remove-Item -LiteralPath ($aclBackup + '.owners') -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath ($aclBackup + '.path') -Force -ErrorAction SilentlyContinue
+        Info 'Original permissions restored.'
+        return $true
+    }
+    Write-Host "ERROR: Permission restore incomplete (restore exit $restoreExit, setowner exit $ownerExit). ACL backup kept: $aclBackup" -ForegroundColor Red
+    return $false
+}
 function Check-Manifest([string]$Root) {
     $manifestPath = Join-Path $Root 'AppxManifest.xml'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'AppxManifest.xml is missing.' }
@@ -101,8 +326,14 @@ function Check-Manifest([string]$Root) {
     }
     if ($manifest.Package.Identity.ProcessorArchitecture -ne 'x64') { throw 'Only x64 was verified.' }
 }
+$exitCode = 0
+$script:AclGrantedThisRun = $false
 try {
     if ($Restore -and $CheckOnly) { throw '-Restore cannot be combined with -CheckOnly.' }
+    if (-not $CheckOnly -and -not (Test-IsAdmin)) {
+        if ($ElevatedChild) { throw 'Elevation did not produce an administrator session.' }
+        exit (Invoke-SelfElevated $PSBoundParameters)
+    }
     $installed = @(Get-AppxPackage -Name Claude -ErrorAction Stop)
     if ($InstallDir) {
         $InstallDir = (Resolve-Path -LiteralPath $InstallDir).Path.TrimEnd('\')
@@ -124,7 +355,6 @@ try {
         else { $NodePath = 'skipped'; $skipSyntax = $true; Write-Warning 'Node.js was not found; skipping JavaScript syntax verification.' }
     }
     Info "Target current Claude installation: $InstallDir"
-    if (-not $CheckOnly) { Stop-TargetClaude $AppDir }
 
     # Backend is embedded to keep the patch engine in a single PS1.
     $backend = @'
@@ -697,6 +927,23 @@ if __name__=='__main__':
     except Exception as exc:log('ERROR: '+str(exc));sys.exit(1)
 
 '@
+    if (-not $CheckOnly) {
+        if (-not $Restore) {
+            # Read-only compatibility gate before any ownership/ACL change, so an
+            # unsupported build never leaves the install with altered permissions.
+            if ($backend -notmatch "(?m)^VERSION = '([^']+)'") { throw 'Cannot read the supported version from the patch engine.' }
+            $supportedVersion = $Matches[1]
+            [xml]$manifestXml = Get-Content -LiteralPath (Join-Path $InstallDir 'AppxManifest.xml') -Raw
+            $installedVersion = [string]$manifestXml.Package.Identity.Version
+            if ($installedVersion -ne $supportedVersion) { throw "Unsupported Claude version: $installedVersion; expected $supportedVersion. No permissions or application files changed." }
+        }
+        # Only stop Claude once the build is known to be supported.
+        Stop-TargetClaude $AppDir
+        if (-not (Test-InstallWritable $InstallDir $AppDir)) {
+            if ($NoAclChange) { Write-Warning 'Installation is not writable and -NoAclChange was given; the engine will report the failure.' }
+            else { Grant-InstallWriteAccess $InstallDir }
+        }
+    }
     $tempScript = Join-Path ([IO.Path]::GetTempPath()) ('claude-patch-' + [Guid]::NewGuid().ToString('N') + '.py')
     [IO.File]::WriteAllText($tempScript,$backend,[Text.UTF8Encoding]::new($false))
     $oldEncoding = $env:PYTHONIOENCODING
@@ -712,10 +959,24 @@ if __name__=='__main__':
         $env:PYTHONIOENCODING = $oldEncoding
         if (Test-Path -LiteralPath $tempScript) { Remove-Item -LiteralPath $tempScript -Force }
     }
-    if ($CheckOnly -or $Restore) { return }
-    Info 'Current Claude installation patched. Start Claude and create a new session for session settings to take effect.'
-    Info ('Restore resources: powershell -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Restore -InstallDir "' + $InstallDir + '"')
+    if ($Restore) {
+        if (-not $NoAclChange -and -not (Restore-InstallAcl $InstallDir)) { $exitCode = 1 }
+    }
+    elseif (-not $CheckOnly) {
+        Info 'Current Claude installation patched. Start Claude and create a new session for session settings to take effect.'
+        Info ('Restore resources: powershell -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Restore -InstallDir "' + $InstallDir + '"')
+    }
 } catch {
-    Write-Error $_.Exception.Message
-    exit 1
+    Write-Host ('ERROR: ' + $_.Exception.Message) -ForegroundColor Red
+    $exitCode = 1
+    # Permissions changed by this run but the patch did not complete (the engine
+    # rolls back its own file writes): put the original ACL back.
+    # On -Restore the restore contract includes the ACL, so revert it even when
+    # the resource restore failed.
+    if (-not $NoAclChange -and (Test-Path variable:AppDir) -and ($script:AclGrantedThisRun -or $Restore)) {
+        Info 'Run did not complete; reverting permission changes to the original ACL.'
+        try { $null = Restore-InstallAcl $InstallDir } catch { Write-Host ('ERROR: ACL revert failed: ' + $_.Exception.Message) -ForegroundColor Red }
+    }
 }
+if ($ElevatedChild) { $null = Read-Host 'Press Enter to close this window' }
+exit $exitCode
