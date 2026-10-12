@@ -172,8 +172,10 @@ function Grant-InstallWriteAccess([string]$Root) {
             if (Test-Path -LiteralPath $aclBackup) { Remove-Item -LiteralPath $aclBackup -Force }
             throw "Could not save a complete ACL backup (icacls exit $saveExit, saved $saved of $expected items); no permissions were changed."
         }
-        $script:AclGrantedThisRun = $true
     }
+    # Set before any ownership/ACL change (also when the backup already existed),
+    # so a failed patch always reverts the permissions this run changed.
+    $script:AclGrantedThisRun = $true
     Info 'Taking ownership of the Claude installation for Administrators...'
     & takeown.exe /F $Root /A /R /D Y | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "takeown failed (exit $LASTEXITCODE). Original ACL backup: $aclBackup" }
