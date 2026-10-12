@@ -45,8 +45,8 @@ function Resolve-Python([string]$Given) {
         return @{ Path = $p; Version = $ver }
     }
     $candidates = @()
-    $found = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($found) { $candidates += $found.Source }
+    $found = @(Get-Command python.exe -All -CommandType Application -ErrorAction SilentlyContinue)
+    foreach ($f in $found) { $candidates += $f.Source }
     $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
     $tried = @()
     foreach ($candidate in $candidates) {
