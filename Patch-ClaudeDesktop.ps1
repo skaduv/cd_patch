@@ -7,7 +7,9 @@ param(
     [string]$NodePath = '',
     [switch]$CheckOnly,
     [Alias('RestoreOriginal')][switch]$Restore,
-    [switch]$SkipSyntaxCheck
+    [switch]$SkipSyntaxCheck,
+    [switch]$NoAclChange,
+    [switch]$ElevatedChild
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -92,6 +94,90 @@ function Stop-TargetClaude([string]$TargetApp) {
         Start-Sleep -Milliseconds 800
     }
 }
+function Test-IsAdmin {
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function Invoke-SelfElevated([System.Collections.IDictionary]$Bound) {
+    # Relaunch this script elevated with the same arguments and wait for it.
+    # The elevated run keeps its own window open at the end so its output can be read.
+    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $PSCommandPath + '"'))
+    foreach ($key in @($Bound.Keys)) {
+        if ($key -eq 'ElevatedChild') { continue }
+        $value = $Bound[$key]
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) { $argList += ('-' + $key) }
+        } else {
+            $argList += ('-' + $key)
+            $argList += ('"' + ([string]$value).TrimEnd('\') + '"')
+        }
+    }
+    $argList += '-ElevatedChild'
+    $hostExe = (Get-Process -Id $PID).Path
+    Info 'Administrator rights are required. Approve the UAC prompt; output continues in the new window.'
+    try {
+        $proc = Start-Process -FilePath $hostExe -ArgumentList $argList -Verb RunAs -Wait -PassThru -ErrorAction Stop
+    } catch {
+        throw 'Elevation was cancelled or failed. Run PowerShell as administrator and retry.'
+    }
+    return $proc.ExitCode
+}
+function Get-AclBackupPath([string]$Root) {
+    $dir = Join-Path $env:LOCALAPPDATA 'ClaudeDesktopPatch'
+    return Join-Path $dir ('acl-' + (Split-Path $Root -Leaf) + '.txt')
+}
+function Test-InstallWritable([string]$Root,[string]$App) {
+    $dirs = @($Root,$App,(Join-Path $App 'resources'),(Join-Path $App 'resources\ion-dist\assets\v1'))
+    foreach ($dir in $dirs) {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        $probe = Join-Path $dir ('.claude-patch-probe-' + [Guid]::NewGuid().ToString('N'))
+        try {
+            ([IO.File]::Open($probe,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)).Dispose()
+            Remove-Item -LiteralPath $probe -Force
+        } catch { return $false }
+    }
+    foreach ($file in @((Join-Path $App 'claude.exe'),(Join-Path $App 'resources\app.asar'))) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+        try { ([IO.File]::Open($file,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)).Dispose() }
+        catch { return $false }
+    }
+    return $true
+}
+function Grant-InstallWriteAccess([string]$Root) {
+    # WindowsApps package folders are owned by TrustedInstaller and Administrators
+    # only get read/execute, so elevation alone cannot write them. Save the
+    # original DACL once (kept across re-runs), then take ownership for
+    # Administrators and grant Administrators + the current user full control.
+    $aclBackup = Get-AclBackupPath $Root
+    if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $aclBackup -Parent) | Out-Null
+        Info "Saving original ACL to $aclBackup"
+        & icacls.exe $Root /save $aclBackup /T /C /Q | Out-Null
+        if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { throw "Could not save the original ACL (icacls exit $LASTEXITCODE); no permissions were changed." }
+    }
+    Info 'Taking ownership of the Claude installation for Administrators...'
+    & takeown.exe /F $Root /A /R /D Y | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "takeown failed (exit $LASTEXITCODE). Original ACL backup: $aclBackup" }
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Info 'Granting write access to Administrators and the current user...'
+    & icacls.exe $Root /grant '*S-1-5-32-544:(OI)(CI)F' ('*' + $me + ':(OI)(CI)F') /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls /grant failed (exit $LASTEXITCODE). Original ACL backup: $aclBackup" }
+}
+function Restore-InstallAcl([string]$Root) {
+    $aclBackup = Get-AclBackupPath $Root
+    if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { return }
+    Info 'Restoring original ACL and TrustedInstaller ownership...'
+    & icacls.exe (Split-Path $Root -Parent) /restore $aclBackup /C /Q | Out-Null
+    $restoreExit = $LASTEXITCODE
+    & icacls.exe $Root /setowner 'NT SERVICE\TrustedInstaller' /T /C /Q | Out-Null
+    $ownerExit = $LASTEXITCODE
+    if ($restoreExit -eq 0 -and $ownerExit -eq 0) {
+        Remove-Item -LiteralPath $aclBackup -Force
+        Info 'Original permissions restored.'
+    } else {
+        Write-Warning "Permission restore incomplete (restore exit $restoreExit, setowner exit $ownerExit). ACL backup kept: $aclBackup"
+    }
+}
 function Check-Manifest([string]$Root) {
     $manifestPath = Join-Path $Root 'AppxManifest.xml'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'AppxManifest.xml is missing.' }
@@ -101,8 +187,13 @@ function Check-Manifest([string]$Root) {
     }
     if ($manifest.Package.Identity.ProcessorArchitecture -ne 'x64') { throw 'Only x64 was verified.' }
 }
+$exitCode = 0
 try {
     if ($Restore -and $CheckOnly) { throw '-Restore cannot be combined with -CheckOnly.' }
+    if (-not $CheckOnly -and -not (Test-IsAdmin)) {
+        if ($ElevatedChild) { throw 'Elevation did not produce an administrator session.' }
+        exit (Invoke-SelfElevated $PSBoundParameters)
+    }
     $installed = @(Get-AppxPackage -Name Claude -ErrorAction Stop)
     if ($InstallDir) {
         $InstallDir = (Resolve-Path -LiteralPath $InstallDir).Path.TrimEnd('\')
@@ -124,7 +215,13 @@ try {
         else { $NodePath = 'skipped'; $skipSyntax = $true; Write-Warning 'Node.js was not found; skipping JavaScript syntax verification.' }
     }
     Info "Target current Claude installation: $InstallDir"
-    if (-not $CheckOnly) { Stop-TargetClaude $AppDir }
+    if (-not $CheckOnly) {
+        Stop-TargetClaude $AppDir
+        if (-not (Test-InstallWritable $InstallDir $AppDir)) {
+            if ($NoAclChange) { Write-Warning 'Installation is not writable and -NoAclChange was given; the engine will report the failure.' }
+            else { Grant-InstallWriteAccess $InstallDir }
+        }
+    }
 
     # Backend is embedded to keep the patch engine in a single PS1.
     $backend = @'
@@ -712,10 +809,14 @@ if __name__=='__main__':
         $env:PYTHONIOENCODING = $oldEncoding
         if (Test-Path -LiteralPath $tempScript) { Remove-Item -LiteralPath $tempScript -Force }
     }
-    if ($CheckOnly -or $Restore) { return }
-    Info 'Current Claude installation patched. Start Claude and create a new session for session settings to take effect.'
-    Info ('Restore resources: powershell -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Restore -InstallDir "' + $InstallDir + '"')
+    if ($Restore) { if (-not $NoAclChange) { Restore-InstallAcl $InstallDir } }
+    elseif (-not $CheckOnly) {
+        Info 'Current Claude installation patched. Start Claude and create a new session for session settings to take effect.'
+        Info ('Restore resources: powershell -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Restore -InstallDir "' + $InstallDir + '"')
+    }
 } catch {
-    Write-Error $_.Exception.Message
-    exit 1
+    Write-Host ('ERROR: ' + $_.Exception.Message) -ForegroundColor Red
+    $exitCode = 1
 }
+if ($ElevatedChild) { $null = Read-Host 'Press Enter to close this window' }
+exit $exitCode
