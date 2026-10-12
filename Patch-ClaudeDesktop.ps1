@@ -142,11 +142,56 @@ function Get-AclBackupPath([string]$Root) {
     $dir = Join-Path $env:LOCALAPPDATA 'ClaudeDesktopPatch'
     return Join-Path $dir ('acl-' + (Split-Path $Root -Leaf) + '-' + $hash + '.txt')
 }
+function Get-FileSha256([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+function Write-AclBackupBinding([string]$Root,[string]$AclBackup) {
+    # Sidecar '.path': line 1 the normalized install path, line 2 the SHA256 of the
+    # DACL save file, line 3 the SHA256 of the per-item owner list.
+    $text = (Get-NormalizedRoot $Root) + "`n" + (Get-FileSha256 $AclBackup) + "`n" + (Get-FileSha256 ($AclBackup + '.owners')) + "`n"
+    [IO.File]::WriteAllText($AclBackup + '.path',$text,[Text.UTF8Encoding]::new($false))
+}
 function Assert-AclBackupBinding([string]$Root,[string]$AclBackup) {
     $bindingPath = $AclBackup + '.path'
+    $ownersPath = $AclBackup + '.owners'
     if (-not (Test-Path -LiteralPath $bindingPath -PathType Leaf)) { throw "ACL backup has no path binding: $AclBackup" }
-    $bound = ([IO.File]::ReadAllText($bindingPath,[Text.Encoding]::UTF8)).Trim()
-    if ($bound -ne (Get-NormalizedRoot $Root)) { throw "ACL backup $AclBackup belongs to '$bound', not '$Root'." }
+    if (-not (Test-Path -LiteralPath $ownersPath -PathType Leaf)) { throw "ACL backup has no owner list: $ownersPath" }
+    $binding = @([IO.File]::ReadAllLines($bindingPath,[Text.Encoding]::UTF8) | ForEach-Object { $_.Trim() })
+    if ($binding.Count -lt 3) { throw "ACL backup binding is incomplete: $bindingPath" }
+    if ($binding[0] -ne (Get-NormalizedRoot $Root)) { throw "ACL backup $AclBackup belongs to '$($binding[0])', not '$Root'." }
+    if ((Get-FileSha256 $AclBackup) -ne $binding[1] -or (Get-FileSha256 $ownersPath) -ne $binding[2]) {
+        throw "ACL backup $AclBackup failed its integrity check (contents changed since it was saved)."
+    }
+}
+function Save-InstallOwners([string]$Root,[string]$OwnersPath) {
+    # icacls /save keeps only DACLs, so record every item's original owner.
+    $items = @(Get-Item -LiteralPath $Root -Force) + @(Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction Stop)
+    $lines = foreach ($item in $items) {
+        $owner = (Get-Acl -LiteralPath $item.FullName -ErrorAction Stop).Owner
+        if (-not $owner) { throw "Cannot read the owner of $($item.FullName)." }
+        $owner + "`t" + $item.FullName
+    }
+    [IO.File]::WriteAllLines($OwnersPath,[string[]]$lines,[Text.UTF8Encoding]::new($false))
+}
+function ConvertTo-IcaclsAccount([string]$Owner) {
+    if ($Owner -match '^S-1-') { return '*' + $Owner }
+    return $Owner
+}
+function Restore-InstallOwners([string]$Root,[string]$OwnersPath) {
+    # Set the most common owner on the whole tree, then fix the items that differ.
+    $entries = @([IO.File]::ReadAllLines($OwnersPath,[Text.Encoding]::UTF8) | Where-Object { $_ } | ForEach-Object {
+        $parts = $_.Split("`t",2); [pscustomobject]@{ Owner = $parts[0]; Path = $parts[1] }
+    })
+    if ($entries.Count -eq 0) { return 1 }
+    $main = ($entries | Group-Object Owner | Sort-Object Count -Descending | Select-Object -First 1).Name
+    & icacls.exe $Root /setowner (ConvertTo-IcaclsAccount $main) /T /C /Q | Out-Null
+    $result = $LASTEXITCODE
+    foreach ($entry in @($entries | Where-Object { $_.Owner -ne $main })) {
+        if (-not (Test-Path -LiteralPath $entry.Path)) { continue }
+        & icacls.exe $entry.Path /setowner (ConvertTo-IcaclsAccount $entry.Owner) /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { $result = $LASTEXITCODE }
+    }
+    return $result
 }
 function Test-InstallWritable([string]$Root,[string]$App) {
     $dirs = @($Root,$App,(Join-Path $App 'resources'),(Join-Path $App 'resources\ion-dist\assets\v1'))
@@ -178,6 +223,8 @@ function Grant-InstallWriteAccess([string]$Root) {
     # Administrators and grant Administrators + the current user full control.
     $aclBackup = Get-AclBackupPath $Root
     if (Test-Path -LiteralPath $aclBackup -PathType Leaf) {
+        # Reuse only a backup that still matches this directory and its recorded
+        # checksums; otherwise stop before any permission change.
         Assert-AclBackupBinding $Root $aclBackup
     } else {
         New-Item -ItemType Directory -Force -Path (Split-Path $aclBackup -Parent) | Out-Null
@@ -196,7 +243,13 @@ function Grant-InstallWriteAccess([string]$Root) {
             if (Test-Path -LiteralPath $aclBackup) { Remove-Item -LiteralPath $aclBackup -Force }
             throw "Could not save a complete ACL backup (icacls exit $saveExit, saved $saved of $expected items); no permissions were changed."
         }
-        [IO.File]::WriteAllText($aclBackup + '.path',(Get-NormalizedRoot $Root),[Text.UTF8Encoding]::new($false))
+        try {
+            Save-InstallOwners $Root ($aclBackup + '.owners')
+            Write-AclBackupBinding $Root $aclBackup
+        } catch {
+            foreach ($f in @($aclBackup,($aclBackup + '.owners'),($aclBackup + '.path'))) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+            throw ('Could not save the original owners: ' + $_.Exception.Message + ' No permissions were changed.')
+        }
     }
     # Set before any ownership/ACL change (also when the backup already existed),
     # so a failed patch always reverts the permissions this run changed.
@@ -214,13 +267,13 @@ function Restore-InstallAcl([string]$Root) {
     if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { return $true }
     try { Assert-AclBackupBinding $Root $aclBackup }
     catch { Write-Host ('ERROR: ' + $_.Exception.Message + ' Permissions were not restored.') -ForegroundColor Red; return $false }
-    Info 'Restoring original ACL and TrustedInstaller ownership...'
+    Info 'Restoring original ACL and per-item ownership...'
     & icacls.exe (Split-Path $Root -Parent) /restore $aclBackup /C /Q | Out-Null
     $restoreExit = $LASTEXITCODE
-    & icacls.exe $Root /setowner 'NT SERVICE\TrustedInstaller' /T /C /Q | Out-Null
-    $ownerExit = $LASTEXITCODE
+    $ownerExit = Restore-InstallOwners $Root ($aclBackup + '.owners')
     if ($restoreExit -eq 0 -and $ownerExit -eq 0) {
         Remove-Item -LiteralPath $aclBackup -Force
+        Remove-Item -LiteralPath ($aclBackup + '.owners') -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath ($aclBackup + '.path') -Force -ErrorAction SilentlyContinue
         Info 'Original permissions restored.'
         return $true
