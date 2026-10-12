@@ -14,7 +14,7 @@
 - **工具搜索**：默认启用 `toolSearchEnabled`，1p 使用 host 模式并向 Code 子进程传递开关；3p 保留新版 host、legacy 和提供方兼容模式的选择逻辑。
 - **WebFetch**：默认启用 `skipWebFetchPreflight`，跳过向 Anthropic 查询域名的预检，保留网络白名单和工具权限。
 - **遥测**：默认启用 `disableEssentialTelemetry` 和 `disableNonessentialTelemetry`，在 1p 模式中强制关闭对应遥测，并设置 Code 子进程禁用遥测、错误报告的环境变量。
-- **简体中文**：从上游 [javaht/claude-desktop-zh-cn](https://github.com/javaht/claude-desktop-zh-cn) 下载语言资源（记录所用提交），按 key 与本机 en-US 资源合并后写入原生界面、前端、statsig 和动态文案的 zh-CN 资源；在主进程与前端的受支持语言列表中加入 `zh-CN`，并让语言菜单显示“简体中文”。上游未翻译的条目保留英文。
+- **简体中文**：使用 Anthropic 官方中文（语言代码 `zh-Hans`）。安装包已自带官方原生界面资源 `resources/zh-Hans.json`，但内置前端（离线/第三方模式使用）缺少 `zh-Hans` 资源且语言列表未包含它。脚本从 `https://claude.ai/i18n/` 下载官方 `zh-Hans.json`、`dynamic/zh-Hans.json` 和 `zh-Hans.overrides.json`，按 key 与本机 en-US 资源合并后写入 `ion-dist/i18n`，在前端受支持语言列表中加入 `zh-Hans`，语言菜单显示“中文（简体）”。官方资源中缺少的条目保留英文。
 - **备份与恢复**：修改前自动备份，恢复前后校验 SHA256。
 - **离线设置入口**：主窗口顶部保留 40px 本地菜单栏，左上角菜单不依赖官网登录页加载；通过“文件 → Configure Third-Party Inference…”打开内置第三方 API 配置页，地区不可用或断网时也能进入。配置页可离线填写，验证凭据和调用模型仍需连接对应提供方。
 - **重复运行秒退**：仅当以下全部成立时直接退出：`patch-report.json` 未被恢复过、补丁引擎指纹（`engineSHA256`）与当前一致、EXE / 当前 ASAR / 前端 asset / 语言资源的完整 SHA256 与报告记录一致、且本次合并出的语言资源与已安装的相同（上游更新后会重新应用）；若上次跳过了语法校验而本次需要校验，则不走跳过、重新执行。
@@ -53,7 +53,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 
 再次执行同一命令即可更新补丁，脚本保留首次原始资源备份。Claude 本体升级后，需确认新版本受脚本支持，并针对新的安装目录重新应用补丁；不要跨版本搬用备份。
 
-完成后在 **Settings → Language** 选择“简体中文”。语言包需要访问 GitHub；无法联网时可用 `-LanguageDir` 指定离线的上游 `resources` 目录（含 `desktop-zh-CN.json`、`frontend-zh-CN.json`、`statsig-zh-CN.json`），或用 `-NoLanguage` 跳过中文。下载失败时不会修改任何程序文件。已装过中文后想改用 `-NoLanguage`，需先执行 `-Restore`，否则脚本会拒绝运行。
+完成后在 **Settings → Language** 选择“中文（简体）”。语言资源需要访问 claude.ai；所在网络或地区无法访问时，可用 `-LanguageDir` 指定离线目录（按 `zh-Hans.json`、`dynamic/zh-Hans.json`、`zh-Hans.overrides.json` 的结构存放从 `https://claude.ai/i18n/` 取得的文件，后两者可省略），或用 `-NoLanguage` 跳过中文。下载失败时不会修改任何程序文件。若上次补丁写过本次不会再写的文件（例如旧版的 `zh-CN` 资源，或装过中文后改用 `-NoLanguage`），脚本会拒绝运行并提示先执行 `-Restore`。
 
 ## 备份与恢复
 
@@ -65,7 +65,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 
 `-RestoreOriginal` 是 `-Restore` 的同义参数。恢复无需 Node.js，仍需要 Python。
 
-恢复会还原脚本修改的 EXE、ASAR 和前端文件并删除新增的 zh-CN 语言资源，并按备份还原安装目录的 ACL 与原所有者；旧版备份中记录的新增文件仍会按清单删除。恢复不会回退账号数据或更改应用注册。若备份丢失，可重新安装官方包恢复程序文件。
+恢复会还原脚本修改的 EXE、ASAR 和前端文件并删除新增的语言资源，并按备份还原安装目录的 ACL 与原所有者；旧版备份中记录的新增文件仍会按清单删除。恢复不会回退账号数据或更改应用注册。若备份丢失，可重新安装官方包恢复程序文件。
 
 ## 参数
 
@@ -78,7 +78,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 | `-NodePath <路径>` | 指定 Node.js 可执行文件 |
 | `-SkipSyntaxCheck` | 跳过 JavaScript 语法校验（无 Node.js 时自动跳过并警告） |
 | `-NoAclChange` | 不自动接管或还原安装目录权限 |
-| `-LanguageDir <路径>` | 使用离线的上游 `resources` 目录作为语言包，不联网下载 |
+| `-LanguageDir <路径>` | 使用离线保存的官方 `zh-Hans` 前端资源，不联网下载 |
 | `-NoLanguage` | 不安装简体中文 |
 
 ## 已知限制
@@ -88,7 +88,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 - 修改 EXE 会使原 Anthropic 数字签名失效；脚本会重新计算并保留 ASAR 完整性校验。原地修改不会更新 MSIX 包签名，Windows 的包完整性检查可能阻止启动或触发修复；官方更新也可能覆盖补丁。
 - 客户端仍使用 Anthropic Messages 协议；任意模型名称通过校验，不代表网关或模型支持全部工具协议。
 - 工具搜索、Computer Use 和 Browser Use 的实际可用性取决于后端能力、组织策略及系统授权。
-- 简体中文来自上游社区翻译；新版新增且上游尚未翻译的条目保留英文，部分写死在代码里的界面文字仍为英文。
+- 前端中文取自 claude.ai 当前线上版本，可能比本机前端新；本机用到而官方资源缺少的条目保留英文，写死在代码里的界面文字仍为英文。
 - 遥测修改未经过完整联网抓包验收，独立 OTLP 导出不在覆盖范围内，不能保证所有遥测流量为零。
 
 
