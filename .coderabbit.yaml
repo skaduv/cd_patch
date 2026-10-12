@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit 配置：所有评审、总结与回复使用简体中文。
+language: "zh-CN"
+tone_instructions: "请始终使用简体中文撰写所有评审评论、总结、建议与聊天回复；代码、命令、路径和标识符保持原样。"
+reviews:
+  profile: "chill"
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+  path_instructions:
+    - path: "Patch-ClaudeDesktop.ps1"
+      instructions: "用中文评审。重点关注：WindowsApps 权限与 ACL 处理、提权流程、备份与恢复的可逆性、补丁正则匹配数量，以及内嵌 Python 引擎的 Windows 兼容性。"
+chat:
+  auto_reply: true
