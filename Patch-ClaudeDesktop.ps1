@@ -165,11 +165,18 @@ function Assert-AclBackupBinding([string]$Root,[string]$AclBackup) {
 }
 function Save-InstallOwners([string]$Root,[string]$OwnersPath) {
     # icacls /save keeps only DACLs, so record every item's original owner.
-    $items = @(Get-Item -LiteralPath $Root -Force) + @(Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction Stop)
+    # Derive relative paths from the root as the file system reports it, so a
+    # differently formed InstallLocation (prefix, short name) cannot skew them.
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    $rootFull = $rootItem.FullName.TrimEnd('\')
+    $items = @($rootItem) + @(Get-ChildItem -LiteralPath $rootItem.FullName -Recurse -Force -ErrorAction Stop)
     $lines = foreach ($item in $items) {
         $owner = (Get-Acl -LiteralPath $item.FullName -ErrorAction Stop).Owner
         if (-not $owner) { throw "Cannot read the owner of $($item.FullName)." }
-        $rel = $item.FullName.Substring($Root.TrimEnd('\').Length).TrimStart('\')
+        $itemFull = $item.FullName.TrimEnd('\')
+        if ($itemFull -eq $rootFull) { $rel = '' }
+        elseif ($itemFull.StartsWith($rootFull + '\',[StringComparison]::OrdinalIgnoreCase)) { $rel = $itemFull.Substring($rootFull.Length + 1) }
+        else { throw "Item $($item.FullName) is not under the install folder $rootFull." }
         $owner + "`t" + $rel
     }
     [IO.File]::WriteAllLines($OwnersPath,[string[]]$lines,[Text.UTF8Encoding]::new($false))
