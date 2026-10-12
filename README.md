@@ -26,7 +26,7 @@
 - Python 3.10 或更高版本。
 - Node.js 24 或更高版本，用于检查补丁后 JavaScript 语法；找不到时自动跳过校验并警告（也可用 `-SkipSyntaxCheck` 显式跳过）。
 - 已安装并为当前 Windows 用户注册 Claude Desktop。
-- 修改和恢复需要管理员权限及安装目录写入权限。脚本会自动处理：非管理员时弹出 UAC 并以管理员身份重新运行自身（输出在新窗口中，结束后按回车关闭）；WindowsApps 目录默认归 TrustedInstaller 所有、管理员也只有只读权限，检测到不可写时脚本会先把原始 ACL 备份到 `%LOCALAPPDATA%\ClaudeDesktopPatch\acl-<包目录名>-<路径哈希>.txt`（另有 `.owners` 记录每个文件的原所有者，`.path` 记录完整安装路径和两份备份的 SHA256；复用和还原前都会校验，不一致则不改权限），再用 `takeown`/`icacls` 把所有权交给 Administrators，并授予 Administrators 和当前用户完全控制。改权限前会先校验 Claude 版本，不支持的版本不会改任何权限；ACL 备份必须完整（icacls 无错误且条目数覆盖全部文件）才继续；若本次改了权限但补丁未完成，会自动还原权限。`-Restore` 会按备份还原 ACL 和每个文件的原所有者，资源恢复失败时也会尝试还原 ACL；还原失败时脚本以非零退出码结束并保留备份。不希望改权限时加 `-NoAclChange`。UAC 请用同一 Windows 用户确认（换账号提权会找不到当前用户注册的 Claude）。无需开启开发者模式。
+- 修改和恢复需要管理员权限及安装目录写入权限。脚本会自动处理：非管理员时弹出 UAC 并以管理员身份重新运行自身（输出在新窗口中，结束后按回车关闭）；WindowsApps 目录默认归 TrustedInstaller 所有、管理员也只有只读权限，检测到不可写时脚本会先把原始 ACL 备份到 `%LOCALAPPDATA%\ClaudeDesktopPatch\acl-<包目录名>-<路径哈希>.txt`（另有 `.owners` 记录每个文件的原所有者，`.path` 记录完整安装路径和两份备份的 SHA256；复用和还原前都会校验，不一致则不改权限；还原时会拒绝指向安装目录之外或经过联接/符号链接的条目，且只恢复清单中记录的条目的所有者），再用 `takeown`/`icacls` 把所有权交给 Administrators，并授予 Administrators 和当前用户完全控制。改权限和关闭 Claude 前会先校验版本，不支持的版本不会关闭 Claude、也不会改任何权限；ACL 备份必须完整（icacls 无错误且条目数覆盖全部文件）才继续；若本次改了权限但补丁未完成，会自动还原权限。`-Restore` 会按备份还原 ACL 和每个文件的原所有者，资源恢复失败时也会尝试还原 ACL；还原失败时脚本以非零退出码结束并保留备份。不希望改权限时加 `-NoAclChange`。UAC 请用同一 Windows 用户确认（换账号提权会找不到当前用户注册的 Claude）。无需开启开发者模式。
 
 ## 快速开始
 
