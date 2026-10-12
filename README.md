@@ -53,7 +53,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 
 再次执行同一命令即可更新补丁，脚本保留首次原始资源备份。Claude 本体升级后，需确认新版本受脚本支持，并针对新的安装目录重新应用补丁；不要跨版本搬用备份。
 
-完成后在 **Settings → Language** 选择“简体中文”。语言包需要访问 GitHub；无法联网时可用 `-LanguageDir` 指定离线的上游 `resources` 目录（含 `desktop-zh-CN.json`、`frontend-zh-CN.json`、`statsig-zh-CN.json`），或用 `-NoLanguage` 跳过中文。下载失败时不会修改任何程序文件。
+完成后在 **Settings → Language** 选择“简体中文”。语言包需要访问 GitHub；无法联网时可用 `-LanguageDir` 指定离线的上游 `resources` 目录（含 `desktop-zh-CN.json`、`frontend-zh-CN.json`、`statsig-zh-CN.json`），或用 `-NoLanguage` 跳过中文。下载失败时不会修改任何程序文件。已装过中文后想改用 `-NoLanguage`，需先执行 `-Restore`，否则脚本会拒绝运行。
 
 ## 备份与恢复
 
