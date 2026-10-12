@@ -14,11 +14,12 @@ Set-StrictMode -Version Latest
 function Info([string]$Message) { Write-Host ('==> ' + $Message) -ForegroundColor Cyan }
 function Test-PythonCandidate([string]$Candidate) {
     # Returns 'major.minor' when the candidate is a usable Python 3.10+, else $null.
-    # Filters out the Microsoft Store stub (a 0-byte app-execution alias) and
-    # anything that cannot actually report its version.
+    # Probes the candidate with '--version'. A Microsoft Store placeholder
+    # (a 0-byte app-execution alias when no Store Python is installed) fails
+    # the probe, while a genuinely Store-installed Python passes it, so the
+    # file size must not be used to judge usability.
     try {
-        $item = Get-Item -LiteralPath $Candidate -ErrorAction Stop
-        if ($item.Length -eq 0) { return $null }
+        $null = Get-Item -LiteralPath $Candidate -ErrorAction Stop
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $Candidate
         $psi.Arguments = '--version'
