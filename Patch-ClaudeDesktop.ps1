@@ -98,6 +98,13 @@ function Test-IsAdmin {
     $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
+function ConvertTo-QuotedArgument([string]$Value) {
+    # Windows command-line quoting: escape embedded quotes and double any
+    # backslashes that precede a quote, so values such as 'C:\' survive intact.
+    $escaped = [regex]::Replace($Value,'(\\*)"',{ param($m) ($m.Groups[1].Value * 2) + '\"' })
+    $escaped = [regex]::Replace($escaped,'(\\+)$',{ param($m) $m.Groups[1].Value * 2 })
+    return '"' + $escaped + '"'
+}
 function Invoke-SelfElevated([System.Collections.IDictionary]$Bound) {
     # Relaunch this script elevated with the same arguments and wait for it.
     # The elevated run keeps its own window open at the end so its output can be read.
@@ -109,7 +116,7 @@ function Invoke-SelfElevated([System.Collections.IDictionary]$Bound) {
             if ($value.IsPresent) { $argList += ('-' + $key) }
         } else {
             $argList += ('-' + $key)
-            $argList += ('"' + ([string]$value).TrimEnd('\') + '"')
+            $argList += (ConvertTo-QuotedArgument ([string]$value))
         }
     }
     $argList += '-ElevatedChild'
@@ -122,9 +129,24 @@ function Invoke-SelfElevated([System.Collections.IDictionary]$Bound) {
     }
     return $proc.ExitCode
 }
+function Get-NormalizedRoot([string]$Root) {
+    return [IO.Path]::GetFullPath($Root).TrimEnd('\').ToLowerInvariant()
+}
 function Get-AclBackupPath([string]$Root) {
+    # Bind the backup to the normalized full install path: the file name carries a
+    # hash of it, and a sidecar '.path' file records it for verification.
+    $norm = Get-NormalizedRoot $Root
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($norm))[0..7] | ForEach-Object { $_.ToString('x2') }) }
+    finally { $sha.Dispose() }
     $dir = Join-Path $env:LOCALAPPDATA 'ClaudeDesktopPatch'
-    return Join-Path $dir ('acl-' + (Split-Path $Root -Leaf) + '.txt')
+    return Join-Path $dir ('acl-' + (Split-Path $Root -Leaf) + '-' + $hash + '.txt')
+}
+function Assert-AclBackupBinding([string]$Root,[string]$AclBackup) {
+    $bindingPath = $AclBackup + '.path'
+    if (-not (Test-Path -LiteralPath $bindingPath -PathType Leaf)) { throw "ACL backup has no path binding: $AclBackup" }
+    $bound = ([IO.File]::ReadAllText($bindingPath,[Text.Encoding]::UTF8)).Trim()
+    if ($bound -ne (Get-NormalizedRoot $Root)) { throw "ACL backup $AclBackup belongs to '$bound', not '$Root'." }
 }
 function Test-InstallWritable([string]$Root,[string]$App) {
     $dirs = @($Root,$App,(Join-Path $App 'resources'),(Join-Path $App 'resources\ion-dist\assets\v1'))
@@ -155,7 +177,9 @@ function Grant-InstallWriteAccess([string]$Root) {
     # original DACL once (kept across re-runs), then take ownership for
     # Administrators and grant Administrators + the current user full control.
     $aclBackup = Get-AclBackupPath $Root
-    if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) {
+    if (Test-Path -LiteralPath $aclBackup -PathType Leaf) {
+        Assert-AclBackupBinding $Root $aclBackup
+    } else {
         New-Item -ItemType Directory -Force -Path (Split-Path $aclBackup -Parent) | Out-Null
         Info "Saving original ACL to $aclBackup"
         # No /C: icacls stops at the first item it cannot read, so exit 0 means every item was saved.
@@ -172,6 +196,7 @@ function Grant-InstallWriteAccess([string]$Root) {
             if (Test-Path -LiteralPath $aclBackup) { Remove-Item -LiteralPath $aclBackup -Force }
             throw "Could not save a complete ACL backup (icacls exit $saveExit, saved $saved of $expected items); no permissions were changed."
         }
+        [IO.File]::WriteAllText($aclBackup + '.path',(Get-NormalizedRoot $Root),[Text.UTF8Encoding]::new($false))
     }
     # Set before any ownership/ACL change (also when the backup already existed),
     # so a failed patch always reverts the permissions this run changed.
@@ -187,6 +212,8 @@ function Grant-InstallWriteAccess([string]$Root) {
 function Restore-InstallAcl([string]$Root) {
     $aclBackup = Get-AclBackupPath $Root
     if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { return $true }
+    try { Assert-AclBackupBinding $Root $aclBackup }
+    catch { Write-Host ('ERROR: ' + $_.Exception.Message + ' Permissions were not restored.') -ForegroundColor Red; return $false }
     Info 'Restoring original ACL and TrustedInstaller ownership...'
     & icacls.exe (Split-Path $Root -Parent) /restore $aclBackup /C /Q | Out-Null
     $restoreExit = $LASTEXITCODE
@@ -194,6 +221,7 @@ function Restore-InstallAcl([string]$Root) {
     $ownerExit = $LASTEXITCODE
     if ($restoreExit -eq 0 -and $ownerExit -eq 0) {
         Remove-Item -LiteralPath $aclBackup -Force
+        Remove-Item -LiteralPath ($aclBackup + '.path') -Force -ErrorAction SilentlyContinue
         Info 'Original permissions restored.'
         return $true
     }
@@ -853,8 +881,10 @@ if __name__=='__main__':
     $exitCode = 1
     # Permissions changed by this run but the patch did not complete (the engine
     # rolls back its own file writes): put the original ACL back.
-    if ($script:AclGrantedThisRun -and -not $Restore) {
-        Info 'Patch did not complete; reverting the permission changes made by this run.'
+    # On -Restore the restore contract includes the ACL, so revert it even when
+    # the resource restore failed.
+    if (-not $NoAclChange -and (Test-Path variable:AppDir) -and ($script:AclGrantedThisRun -or $Restore)) {
+        Info 'Run did not complete; reverting permission changes to the original ACL.'
         try { $null = Restore-InstallAcl $InstallDir } catch { Write-Host ('ERROR: ACL revert failed: ' + $_.Exception.Message) -ForegroundColor Red }
     }
 }
