@@ -321,7 +321,19 @@ def verify_asar(path, patched_names):
                     raise ValueError('Truncated ASAR data: ' + full)
                 check_integrity(entry, data, full)
             elif integrity:
+                # Streaming whole-file + per-block validation without loading
+                # the full entry. Mirrors check_integrity's block contract:
+                # ceil(size/blockSize) blocks, or a single empty block.
+                bs = integrity.get('blockSize')
+                blocks = integrity.get('blocks')
+                if (integrity.get('algorithm') != 'SHA256' or type(bs) is not int
+                        or bs <= 0 or type(blocks) is not list
+                        or any(type(b) is not str for b in blocks)):
+                    raise ValueError('ASAR integrity metadata invalid: ' + full)
                 h = hashlib.sha256()
+                bh = hashlib.sha256()
+                in_block = 0
+                bi = 0
                 remaining = size
                 while remaining:
                     chunk = f.read(min(1 << 20, remaining))
@@ -329,7 +341,23 @@ def verify_asar(path, patched_names):
                         raise ValueError('Truncated ASAR data: ' + full)
                     h.update(chunk)
                     remaining -= len(chunk)
-                if integrity.get('algorithm') != 'SHA256' or h.hexdigest() != integrity['hash']:
+                    pos = 0
+                    while pos < len(chunk):
+                        take = min(bs - in_block, len(chunk) - pos)
+                        bh.update(chunk[pos:pos + take])
+                        in_block += take
+                        pos += take
+                        if in_block == bs:
+                            if bi >= len(blocks) or bh.hexdigest() != blocks[bi]:
+                                raise ValueError('ASAR block mismatch: ' + full)
+                            bi += 1
+                            bh = hashlib.sha256()
+                            in_block = 0
+                if in_block or not size:
+                    if bi >= len(blocks) or bh.hexdigest() != blocks[bi]:
+                        raise ValueError('ASAR block mismatch: ' + full)
+                    bi += 1
+                if bi != len(blocks) or h.hexdigest() != integrity.get('hash'):
                     raise ValueError('ASAR hash mismatch: ' + full)
             done_bytes += size
             if done_bytes >= next_log or i == total:
@@ -612,7 +640,7 @@ def main():
         log('Pre-modification backup verified: '+str(backup))
         # Prepare all files before replacing any originals. Roll back the full set
         # on any failed write, including external JS.
-        staged=[]
+        staged=[];replaced=False
         try:
             for path,data in writes.items():
                 path.parent.mkdir(parents=True,exist_ok=True)
@@ -623,13 +651,15 @@ def main():
                 asar_stage=pathlib.Path(handle.name)
             staged.append((asar_stage,asar_path))
             shutil.copyfile(final_tmp,asar_stage)
-            for temp,path in staged:os.replace(temp,path)
+            for temp,path in staged:
+                os.replace(temp,path);replaced=True
             log('Verifying installed ASAR...')
             verify_asar(asar_path,patched_names)
             if new_hash.encode() not in exe_path.read_bytes():raise ValueError('EXE header hash verification failed')
             (app.parent/'patch-report.json').write_bytes(dump(report_obj))
         except BaseException:
-            restore(app,backup);raise
+            if replaced:restore(app,backup)
+            raise
         finally:
             for temp,path in staged:
                 if temp.exists():temp.unlink()
