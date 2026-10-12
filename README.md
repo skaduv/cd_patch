@@ -26,7 +26,7 @@
 - Python 3.10 或更高版本。
 - Node.js 24 或更高版本，用于检查补丁后 JavaScript 语法；找不到时自动跳过校验并警告（也可用 `-SkipSyntaxCheck` 显式跳过）。
 - 已安装并为当前 Windows 用户注册 Claude Desktop。
-- 修改和恢复时，需对安装目录及程序文件具有写入权限；建议使用同一 Windows 用户以管理员身份运行 PowerShell。WindowsApps 目录即使提权后也可能拒绝写入，脚本会检查并报错，不会自动更改目录所有权或权限。无需开启开发者模式。
+- 修改和恢复需要管理员权限及安装目录写入权限。脚本会自动处理：非管理员时弹出 UAC 并以管理员身份重新运行自身（输出在新窗口中，结束后按回车关闭）；WindowsApps 目录默认归 TrustedInstaller 所有、管理员也只有只读权限，检测到不可写时脚本会先把原始 ACL 备份到 `%LOCALAPPDATA%\ClaudeDesktopPatch\acl-<包目录名>.txt`，再用 `takeown`/`icacls` 把所有权交给 Administrators，并授予 Administrators 和当前用户完全控制。`-Restore` 会按备份还原 ACL 并把所有者改回 TrustedInstaller。不希望改权限时加 `-NoAclChange`。UAC 请用同一 Windows 用户确认（换账号提权会找不到当前用户注册的 Claude）。无需开启开发者模式。
 
 ## 快速开始
 
@@ -40,13 +40,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 
 ### 2. 修改当前安装
 
-退出 Claude，使用同一 Windows 用户以管理员身份打开 PowerShell，运行：
+退出 Claude，在 PowerShell 中运行（非管理员时会自动弹出 UAC）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop.ps1"
 ```
 
-脚本会关闭目标安装目录下仍在运行的 Claude 进程，检查写入权限，备份原始资源并直接写入补丁。完成后手动启动 Claude，并新建会话使会话设置生效。应用注册和用户数据保持不变。
+脚本会关闭目标安装目录下仍在运行的 Claude 进程，检查写入权限（必要时备份 ACL 并接管权限），备份原始资源并直接写入补丁。完成后手动启动 Claude，并新建会话使会话设置生效。应用注册和用户数据保持不变。
 
 如果当前用户注册了多个 Claude 安装，可用 `-InstallDir` 指定其中一个安装根目录（包含 `AppxManifest.xml` 的目录）。该参数不能指向未注册的目录。
 
@@ -64,7 +64,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 
 `-RestoreOriginal` 是 `-Restore` 的同义参数。恢复无需 Node.js，仍需要 Python。
 
-恢复会还原脚本修改的 EXE、ASAR 和前端文件；旧版备份中记录的新增文件仍会按清单删除。恢复不会回退账号数据或更改应用注册。若备份丢失，可重新安装官方包恢复程序文件。
+恢复会还原脚本修改的 EXE、ASAR 和前端文件，并按备份还原安装目录的 ACL 与 TrustedInstaller 所有权；旧版备份中记录的新增文件仍会按清单删除。恢复不会回退账号数据或更改应用注册。若备份丢失，可重新安装官方包恢复程序文件。
 
 ## 参数
 
@@ -76,10 +76,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "\路径\Patch-ClaudeDesktop
 | `-PythonPath <路径>` | 指定 Python 可执行文件 |
 | `-NodePath <路径>` | 指定 Node.js 可执行文件 |
 | `-SkipSyntaxCheck` | 跳过 JavaScript 语法校验（无 Node.js 时自动跳过并警告） |
+| `-NoAclChange` | 不自动接管或还原安装目录权限 |
 
 ## 已知限制
 
 - 补丁严格检查版本和每个替换点的匹配数量；Claude 更新后需要重新适配。
+- 自动接管权限会修改 WindowsApps 中该包目录的所有者和 ACL，可能影响 Microsoft Store 更新或修复；用 `-Restore` 还原，或重新安装官方包。
 - 修改 EXE 会使原 Anthropic 数字签名失效；脚本会重新计算并保留 ASAR 完整性校验。原地修改不会更新 MSIX 包签名，Windows 的包完整性检查可能阻止启动或触发修复；官方更新也可能覆盖补丁。
 - 客户端仍使用 Anthropic Messages 协议；任意模型名称通过校验，不代表网关或模型支持全部工具协议。
 - 工具搜索、Computer Use 和 Browser Use 的实际可用性取决于后端能力、组织策略及系统授权。
