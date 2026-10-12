@@ -169,7 +169,8 @@ function Save-InstallOwners([string]$Root,[string]$OwnersPath) {
     $lines = foreach ($item in $items) {
         $owner = (Get-Acl -LiteralPath $item.FullName -ErrorAction Stop).Owner
         if (-not $owner) { throw "Cannot read the owner of $($item.FullName)." }
-        $owner + "`t" + $item.FullName
+        $rel = $item.FullName.Substring($Root.TrimEnd('\').Length).TrimStart('\')
+        $owner + "`t" + $rel
     }
     [IO.File]::WriteAllLines($OwnersPath,[string[]]$lines,[Text.UTF8Encoding]::new($false))
 }
@@ -177,18 +178,49 @@ function ConvertTo-IcaclsAccount([string]$Owner) {
     if ($Owner -match '^S-1-') { return '*' + $Owner }
     return $Owner
 }
+function Resolve-ContainedPath([string]$Root,[string]$Relative) {
+    # Map a backup-relative path to a full path that must stay inside $Root and
+    # must not pass through a reparse point (junction/symlink). Returns $null if not.
+    if ($Relative -match '(^|[\\/])\.\.([\\/]|$)' -or $Relative -match ':' -or $Relative.StartsWith('\') -or $Relative.StartsWith('/')) { return $null }
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $full = if ($Relative) { [IO.Path]::GetFullPath((Join-Path $rootFull $Relative)) } else { $rootFull }
+    if ($full -ne $rootFull -and -not $full.StartsWith($rootFull + '\',[StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $cursor = $full
+    while ($cursor.Length -ge $rootFull.Length) {
+        if (Test-Path -LiteralPath $cursor) {
+            $attrs = (Get-Item -LiteralPath $cursor -Force).Attributes
+            if ($attrs -band [IO.FileAttributes]::ReparsePoint) { return $null }
+        }
+        if ($cursor -eq $rootFull) { break }
+        $cursor = Split-Path $cursor -Parent
+    }
+    return $full
+}
+function Test-AclSaveFilePaths([string]$Root,[string]$AclBackup) {
+    # icacls /restore applies paths relative to the parent folder; every entry must
+    # name this install folder or something beneath it.
+    $leaf = Split-Path $Root -Leaf
+    $lines = @([IO.File]::ReadAllLines($AclBackup,[Text.Encoding]::Unicode) | Where-Object { $_.Trim() })
+    for ($i = 0; $i -lt $lines.Count; $i += 2) {
+        $path = $lines[$i].Trim()
+        if ($path -ne $leaf -and -not $path.StartsWith($leaf + '\',[StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if (-not (Resolve-ContainedPath $Root $path.Substring($leaf.Length).TrimStart('\'))) { return $false }
+    }
+    return $true
+}
 function Restore-InstallOwners([string]$Root,[string]$OwnersPath) {
-    # Set the most common owner on the whole tree, then fix the items that differ.
+    # Restore owners only for the items recorded before the first permission change;
+    # items created later (for example patch-backup) keep their current owner.
     $entries = @([IO.File]::ReadAllLines($OwnersPath,[Text.Encoding]::UTF8) | Where-Object { $_ } | ForEach-Object {
-        $parts = $_.Split("`t",2); [pscustomobject]@{ Owner = $parts[0]; Path = $parts[1] }
+        $parts = $_.Split("`t",2); [pscustomobject]@{ Owner = $parts[0]; Path = $(if ($parts.Count -gt 1) { $parts[1] } else { '' }) }
     })
     if ($entries.Count -eq 0) { return 1 }
-    $main = ($entries | Group-Object Owner | Sort-Object Count -Descending | Select-Object -First 1).Name
-    & icacls.exe $Root /setowner (ConvertTo-IcaclsAccount $main) /T /C /Q | Out-Null
-    $result = $LASTEXITCODE
-    foreach ($entry in @($entries | Where-Object { $_.Owner -ne $main })) {
-        if (-not (Test-Path -LiteralPath $entry.Path)) { continue }
-        & icacls.exe $entry.Path /setowner (ConvertTo-IcaclsAccount $entry.Owner) /C /Q | Out-Null
+    $result = 0
+    foreach ($entry in $entries) {
+        $full = Resolve-ContainedPath $Root $entry.Path
+        if (-not $full) { Write-Host "ERROR: Owner list entry outside the install folder rejected: $($entry.Path)" -ForegroundColor Red; $result = 1; continue }
+        if (-not (Test-Path -LiteralPath $full)) { continue }
+        & icacls.exe $full /setowner (ConvertTo-IcaclsAccount $entry.Owner) /C /Q | Out-Null
         if ($LASTEXITCODE -ne 0) { $result = $LASTEXITCODE }
     }
     return $result
@@ -267,6 +299,10 @@ function Restore-InstallAcl([string]$Root) {
     if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { return $true }
     try { Assert-AclBackupBinding $Root $aclBackup }
     catch { Write-Host ('ERROR: ' + $_.Exception.Message + ' Permissions were not restored.') -ForegroundColor Red; return $false }
+    if (-not (Test-AclSaveFilePaths $Root $aclBackup)) {
+        Write-Host "ERROR: ACL backup $aclBackup lists paths outside the install folder. Permissions were not restored." -ForegroundColor Red
+        return $false
+    }
     Info 'Restoring original ACL and per-item ownership...'
     & icacls.exe (Split-Path $Root -Parent) /restore $aclBackup /C /Q | Out-Null
     $restoreExit = $LASTEXITCODE
@@ -319,7 +355,6 @@ try {
         else { $NodePath = 'skipped'; $skipSyntax = $true; Write-Warning 'Node.js was not found; skipping JavaScript syntax verification.' }
     }
     Info "Target current Claude installation: $InstallDir"
-    if (-not $CheckOnly) { Stop-TargetClaude $AppDir }
 
     # Backend is embedded to keep the patch engine in a single PS1.
     $backend = @'
@@ -902,6 +937,8 @@ if __name__=='__main__':
             $installedVersion = [string]$manifestXml.Package.Identity.Version
             if ($installedVersion -ne $supportedVersion) { throw "Unsupported Claude version: $installedVersion; expected $supportedVersion. No permissions or application files changed." }
         }
+        # Only stop Claude once the build is known to be supported.
+        Stop-TargetClaude $AppDir
         if (-not (Test-InstallWritable $InstallDir $AppDir)) {
             if ($NoAclChange) { Write-Warning 'Installation is not writable and -NoAclChange was given; the engine will report the failure.' }
             else { Grant-InstallWriteAccess $InstallDir }
