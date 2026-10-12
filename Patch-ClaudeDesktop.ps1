@@ -386,32 +386,40 @@ def sha(b): return hashlib.sha256(b).hexdigest()
 def dump(o): return json.dumps(o, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 def log(s): print(s, flush=True)
 
-# ---- Simplified Chinese language pack (upstream: javaht/claude-desktop-zh-cn) ----
+# ---- Simplified Chinese (official Anthropic catalogs) ----
+# Claude ships Simplified Chinese as locale "zh-Hans": the desktop shell catalog
+# (resources/zh-Hans.json) is already in the package, but the bundled frontend
+# (ion-dist) has no zh-Hans catalog and leaves it out of its locale lists. The
+# frontend catalogs are fetched from claude.ai, the same files the web app loads.
 import urllib.request, urllib.error, http.client, time
 
-LANGUAGE_REPOSITORY = 'https://github.com/javaht/claude-desktop-zh-cn'
-LANGUAGE_FILES = {
-    'zh-CN.json': 'desktop-zh-CN.json',
-    'ion-dist/i18n/zh-CN.json': 'frontend-zh-CN.json',
-    'ion-dist/i18n/statsig/zh-CN.json': 'statsig-zh-CN.json',
+LANGUAGE_CODE = 'zh-Hans'
+LANGUAGE_SOURCE = 'https://claude.ai/i18n/'
+LANGUAGE_FILES = {  # target under resources/ion-dist/i18n -> required
+    'zh-Hans.json': True,
+    'dynamic/zh-Hans.json': False,
+    'zh-Hans.overrides.json': False,
 }
 LOCALE_LIST = r'\["en-US","de-DE","fr-FR","ko-KR","ja-JP","es-419","es-ES","it-IT","hi-IN","pt-BR","id-ID"\]'
-LOCALE_LIST_BYTES = re.compile(LOCALE_LIST.encode('ascii'))
+LOCALE_LIST_MATCHES = 2  # verified on 2.31226.1.0: one shared bundle, two lists
 LANGUAGE_NAME_ENTRY = r'"en-US":\{name:"English \(United States\)",localName:"English \(United States\)"\}'
-DISPLAY_NAME_MARKER = '__claudeZhLabelPatch'
-DISPLAY_NAME_PATCH = (';(()=>{const e=Intl.DisplayNames&&Intl.DisplayNames.prototype;if(!e||e.'+DISPLAY_NAME_MARKER+')return;'
-    'const n=e.of;e.of=function(e){return String(e)==="zh-CN"?"简体中文":n.call(this,e)},'
-    'Object.defineProperty(e,"'+DISPLAY_NAME_MARKER+'",{value:!0})})();')
+LANGUAGE_NAME_REPLACEMENT = ('"en-US":{name:"English (United States)",localName:"English (United States)"},'
+    '"zh-Hans":{name:"Chinese (Simplified)",localName:"中文（简体）"}')
+BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36'
 
 def add_zh_locale(text):
-    return re.subn(LOCALE_LIST, lambda m: m[0][:-1] + ',"zh-CN"]', text)
+    return re.subn(LOCALE_LIST, lambda m: m[0][:-1] + ',"' + LANGUAGE_CODE + '"]', text)
 
 def fetch_language(url):
-    request = urllib.request.Request(url, headers={'User-Agent': 'ClaudeDesktop-language-pack'})
+    request = urllib.request.Request(url, headers={'User-Agent': BROWSER_UA, 'Accept': 'application/json'})
     for attempt in range(3):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404: return None
+            if attempt == 2: raise
+            time.sleep(attempt + 1)
         except (urllib.error.URLError, http.client.IncompleteRead, TimeoutError):
             if attempt == 2: raise
             time.sleep(attempt + 1)
@@ -423,45 +431,44 @@ def read_catalog(data, label):
     return value
 
 def merged_catalogs(resources, directory=None):
-    """Merge upstream zh-CN catalogs with this build's en-US catalogs by key.
+    """Merge the official zh-Hans frontend catalogs with this build's en-US ones by key.
 
-    Keys the upstream pack does not translate keep their English text, so the
-    set of keys always matches the installed build.
+    claude.ai may be newer than the bundled frontend: keys this build does not
+    use are dropped and keys missing from the official catalog keep English.
+    Returns ({target: catalog}, {target: sha256 of the source file}).
     """
-    revision = None
+    i18n = resources/'ion-dist/i18n'
+    if not (resources/(LANGUAGE_CODE + '.json')).is_file():
+        raise ValueError('This build has no official ' + LANGUAGE_CODE + ' desktop catalog; no files changed')
     if directory is None:
-        log('Downloading Simplified Chinese language pack from ' + LANGUAGE_REPOSITORY + ' ...')
-        try:
-            revision = json.loads(fetch_language('https://api.github.com/repos/javaht/claude-desktop-zh-cn/commits/main'))['sha']
-        except Exception as exc:
-            raise ValueError('Cannot download the language pack (' + str(exc) + '). Use -LanguageDir for an offline copy or -NoLanguage to skip Chinese. No application files changed.') from exc
-        if not re.fullmatch(r'[0-9a-f]{40}', revision): raise ValueError('Invalid upstream revision')
-    packs = {}
-    for target, source in LANGUAGE_FILES.items():
+        log('Downloading official Simplified Chinese catalogs from ' + LANGUAGE_SOURCE + ' ...')
+    sources = {}
+    for target, required in LANGUAGE_FILES.items():
         if directory is not None:
-            data = (directory/source).read_bytes()
+            path = directory/target
+            data = path.read_bytes() if path.is_file() else None
         else:
             try:
-                data = fetch_language(f'https://raw.githubusercontent.com/javaht/claude-desktop-zh-cn/{revision}/resources/{source}')
+                data = fetch_language(LANGUAGE_SOURCE + target)
             except Exception as exc:
-                raise ValueError('Cannot download ' + source + ' (' + str(exc) + '). Use -LanguageDir or -NoLanguage. No application files changed.') from exc
-        packs[target] = read_catalog(data, source)
-        if not packs[target]: raise ValueError('Empty upstream language catalog: ' + source)
+                raise ValueError('Cannot download ' + LANGUAGE_SOURCE + target + ' (' + str(exc) + '). '
+                    'Use -LanguageDir with an offline copy or -NoLanguage to skip Chinese. No application files changed.') from exc
+        if data is None:
+            if required: raise ValueError('Official language catalog not found: ' + target + '. No application files changed.')
+            continue
+        sources[target] = data
+    packs = {t: read_catalog(d, t) for t, d in sources.items()}
+    if not packs['zh-Hans.json']: raise ValueError('Empty official language catalog: zh-Hans.json')
+    base = packs['zh-Hans.json']
     result = {}
-    for target, translations in packs.items():
-        english = resources/target.replace('zh-CN', 'en-US')
-        if english.is_file():
-            baseline = read_catalog(english.read_bytes(), str(english))
-            result[target] = {k: translations.get(k, v) for k, v in baseline.items()}
-        else:
-            result[target] = translations
-    dynamic = resources/'ion-dist/i18n/dynamic/en-US.json'
-    if dynamic.is_file():
-        baseline = read_catalog(dynamic.read_bytes(), str(dynamic))
-        translations = packs['ion-dist/i18n/zh-CN.json']
-        result['ion-dist/i18n/dynamic/zh-CN.json'] = {k: translations.get(k, v) for k, v in baseline.items()}
-    result['ion-dist/i18n/zh-CN.overrides.json'] = {}
-    return result, revision
+    english = read_catalog((i18n/'en-US.json').read_bytes(), 'en-US.json')
+    result['zh-Hans.json'] = {k: base.get(k, v) for k, v in english.items()}
+    dyn_en = i18n/'dynamic/en-US.json'
+    if dyn_en.is_file():
+        dyn = packs.get('dynamic/zh-Hans.json', {})
+        result['dynamic/zh-Hans.json'] = {k: dyn.get(k, base.get(k, v)) for k, v in read_catalog(dyn_en.read_bytes(), 'dynamic/en-US.json').items()}
+    result['zh-Hans.overrides.json'] = packs.get('zh-Hans.overrides.json', {})
+    return {'ion-dist/i18n/' + t: c for t, c in result.items()}, {t: sha(d) for t, d in sources.items()}
 
 # Never use tempfile.TemporaryFile/NamedTemporaryFile/mkstemp inside the Claude
 # installation directory. On Windows, CPython's tempfile retries every
@@ -556,7 +563,7 @@ def apply_pre_patch(data, report):
 
 PROGRESS_BYTES = 64 << 20
 
-def stream_build_asar(source, body_tmp_path, report, language=False):
+def stream_build_asar(source, body_tmp_path, report):
     """Validate, patch and rebuild the ASAR in a single streaming pass.
 
     Each packed file is read exactly once: its integrity is verified, patches
@@ -584,7 +591,6 @@ def stream_build_asar(source, body_tmp_path, report, language=False):
         main_hit = None
         window_hit = None
         pre_hit = False
-        native_locale_hits = 0
         patched_texts = {}
         with open(body_tmp_path, 'wb') as body:
             done_bytes = 0
@@ -612,11 +618,6 @@ def stream_build_asar(source, body_tmp_path, report, language=False):
                     window_hit = full
                     new_data = patch_window_menu(data.decode('utf8'), report).encode('utf8')
                     patched_texts[full] = new_data
-                if language and full.endswith('.js') and LOCALE_LIST_BYTES.search(new_data):
-                    text, hits = add_zh_locale(new_data.decode('utf8'))
-                    new_data = text.encode('utf8')
-                    patched_texts[full] = new_data
-                    native_locale_hits += hits
                 new_entry = new_entries[full]
                 new_entry['offset'] = str(body.tell())
                 new_entry['size'] = len(new_data)
@@ -633,12 +634,6 @@ def stream_build_asar(source, body_tmp_path, report, language=False):
         raise ValueError('Cannot uniquely identify local window menu; no files changed')
     if not pre_hit:
         raise ValueError('Preload bundle not found: .vite/build/index.pre.js')
-    if language:
-        # Optional by design: the main process may not carry its own locale list
-        # (the frontend list is required and checked separately). Report the count.
-        if not native_locale_hits:
-            log('NOTE: no supported-locale list found in the main process bundles; relying on the frontend list.')
-        report.append({'patch': 'native supported locale literals', 'matches': native_locale_hits, 'required': False})
     log(f'Source ASAR verified and rebuilt: {total} files')
     return {'header': new_hdr, 'old_header_hash': old_header_hash,
             'patched_texts': patched_texts, 'file_count': total}
@@ -926,27 +921,14 @@ def main():
     # Language catalogs are prepared before anything else so a download failure
     # changes nothing. English baselines come from the pre-patch backup when present.
     use_language=not args.no_language
-    language_writes={};language_report={};language_revision=None
-    if not use_language:
-        # A previous run installed Chinese: its catalogs and locale-list edits are
-        # not rewritten by a -NoLanguage run, so require a clean restore first.
-        prev_lang=False
-        prev_report_path=app.parent/'patch-report.json'
-        if prev_report_path.exists():
-            try:
-                prev_report=json.loads(prev_report_path.read_text(encoding='utf8'))
-                prev_lang=bool(prev_report.get('language')) and not prev_report.get('resourcesRestored')
-            except Exception: prev_lang=False
-        leftover=[rel for rel,meta in inv.items() if not meta.get('existed') and 'zh-CN' in rel and (app/rel).exists()]
-        if prev_lang or leftover:
-            raise ValueError('Simplified Chinese from a previous patch is still installed. Run -Restore first, then patch again with -NoLanguage. No application files changed.')
+    language_writes={};language_report={};language_sources=None
     if use_language:
         resources=app/'resources'
-        packs,language_revision=merged_catalogs(resources,pathlib.Path(args.language).resolve() if args.language else None)
+        packs,language_sources=merged_catalogs(resources,pathlib.Path(args.language).resolve() if args.language else None)
         for target,pack in packs.items():
             language_writes[resources/target]=dump(pack)
             language_report[target]={'keys':len(pack),'withChinese':sum(bool(re.search(r'[\u3400-\u9fff]',x)) for x in pack.values())}
-        log('Language pack prepared: '+', '.join(f"{k} ({v['withChinese']}/{v['keys']} Chinese)" for k,v in language_report.items()))
+        log('Language catalogs prepared: '+', '.join(f"{k} ({v['withChinese']}/{v['keys']} Chinese)" for k,v in language_report.items()))
     if not args.check_only and not args.restore:
         # Skip quickly when the installed files exactly match this patch build.
         prev={}
@@ -989,7 +971,7 @@ def main():
         body_tmp=td/'body.bin'
         final_tmp=td/'app.asar'
         log('Validating source ASAR and rebuilding in a single streaming pass (reads the full archive once; may take a few minutes)...')
-        built=stream_build_asar(source,body_tmp,report,language=use_language)
+        built=stream_build_asar(source,body_tmp,report)
         old_hash=built['old_header_hash']
         patched_names=set(built['patched_texts'])
         writes={}
@@ -1007,27 +989,15 @@ def main():
         front_rel=front[0].relative_to(app).as_posix()
         if use_language:
             def current(path): return writes[path].decode('utf8') if path in writes else asset_texts[path]
-            # Supported-locale lists (newer builds keep more than one per bundle).
             locale_assets=[p for p in asset_texts if re.search(LOCALE_LIST,asset_texts[p])]
-            if not locale_assets:raise ValueError('Cannot find the frontend supported-locale list; no files changed')
-            locale_hits=0
-            for path in locale_assets:
-                text,hits=add_zh_locale(current(path));writes[path]=text.encode('utf8');locale_hits+=hits
-            report.append({'patch':'frontend supported locales','files':len(locale_assets),'matches':locale_hits})
-            # Language menu label: the static name table when present, otherwise
-            # an Intl.DisplayNames fallback so the menu shows 简体中文.
+            if len(locale_assets)!=1:raise ValueError(f'Cannot uniquely identify the frontend supported-locale lists (found {len(locale_assets)} files); no files changed')
+            text,hits=add_zh_locale(current(locale_assets[0]))
+            if hits!=LOCALE_LIST_MATCHES:raise ValueError(f'frontend supported locales: expected {LOCALE_LIST_MATCHES} matches, found {hits}; no files changed')
+            writes[locale_assets[0]]=text.encode('utf8')
+            report.append({'patch':'frontend supported locales','matches':hits})
             name_assets=[p for p in asset_texts if re.search(LANGUAGE_NAME_ENTRY,asset_texts[p])]
-            if len(name_assets)>1:raise ValueError('Cannot uniquely identify the language name table; no files changed')
-            if name_assets:
-                writes[name_assets[0]]=once(current(name_assets[0]),LANGUAGE_NAME_ENTRY,
-                    '"zh-CN":{name:"Chinese (Simplified)",localName:"简体中文"},"en-US":{name:"English (United States)",localName:"English (United States)"}',
-                    'language menu',report).encode('utf8')
-            else:
-                display_assets=[p for p in asset_texts if 'Intl.DisplayNames' in asset_texts[p]]
-                if not display_assets:raise ValueError('Cannot find the language name table or Intl.DisplayNames in the frontend; no files changed')
-                for path in display_assets:
-                    writes[path]=(current(path)+DISPLAY_NAME_PATCH).encode('utf8')
-                report.append({'patch':'language menu (Intl.DisplayNames fallback)','files':len(display_assets)})
+            if len(name_assets)!=1:raise ValueError('Cannot uniquely identify the language name table; no files changed')
+            writes[name_assets[0]]=once(current(name_assets[0]),LANGUAGE_NAME_ENTRY,LANGUAGE_NAME_REPLACEMENT,'language menu',report).encode('utf8')
             writes.update(language_writes)
         if args.skip_syntax_check:
             log('WARNING: JavaScript syntax verification skipped (--skip-syntax-check).')
@@ -1052,10 +1022,26 @@ def main():
             'engineSHA256':engine_id,
             'frontendAsset':{'path':front_rel,'sha256':sha(writes[front[0]])},
             'writtenFiles':{p.relative_to(app).as_posix():sha(b) for p,b in writes.items() if p!=front[0]},
-            'language':language_report,'languageSource':LANGUAGE_REPOSITORY if use_language and not args.language else (args.language or None),
-            'languageRevision':language_revision}
+            'language':language_report,'languageCode':LANGUAGE_CODE if use_language else None,
+            'languageSource':(args.language or LANGUAGE_SOURCE) if use_language else None,
+            'languageSourceSHA256':language_sources}
         if args.check_only:
             log(json.dumps(report_obj,ensure_ascii=False,indent=2));log('CHECK ONLY: no application files changed.');return
+        # A previous patch may have written files this run will not rewrite (another
+        # language code, or Chinese before a -NoLanguage run). Overwriting the rest
+        # would leave those behind, so require a clean restore first.
+        prev_written={}
+        prev_report_path=app.parent/'patch-report.json'
+        if prev_report_path.exists():
+            try:
+                prev_report=json.loads(prev_report_path.read_text(encoding='utf8'))
+                if not prev_report.get('resourcesRestored') and isinstance(prev_report.get('writtenFiles'),dict):prev_written=prev_report['writtenFiles']
+            except Exception: prev_written={}
+        planned={p.relative_to(app).as_posix() for p in writes}|{front_rel}
+        stale=sorted({rel for rel in prev_written if rel not in planned}
+            |{rel for rel,meta in inv.items() if not meta.get('existed') and rel not in planned and (app/rel).exists()})
+        if stale:
+            raise ValueError('Files from a previous patch would be left behind ('+', '.join(stale[:5])+('...' if len(stale)>5 else '')+'). Run -Restore first, then patch again. No application files changed.')
         writes[exe_path]=patched_exe
         for path in list(writes)+[app/'resources/app.asar']:backup_file(app,path,backup,inv)
         inventory_path.write_bytes(dump(inv))
@@ -1134,7 +1120,7 @@ if __name__=='__main__':
     }
     elseif (-not $CheckOnly) {
         Info 'Current Claude installation patched. Start Claude and create a new session for session settings to take effect.'
-        if (-not $NoLanguage) { Info 'Select 简体中文 in Claude Settings / Language.' }
+        if (-not $NoLanguage) { Info 'Select 中文（简体） in Claude Settings / Language.' }
         Info ('Restore resources: powershell -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Restore -InstallDir "' + $InstallDir + '"')
     }
 } catch {
