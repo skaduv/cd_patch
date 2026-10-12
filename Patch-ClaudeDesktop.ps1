@@ -136,7 +136,13 @@ function Test-InstallWritable([string]$Root,[string]$App) {
             Remove-Item -LiteralPath $probe -Force
         } catch { return $false }
     }
-    foreach ($file in @((Join-Path $App 'claude.exe'),(Join-Path $App 'resources\app.asar'))) {
+    # Every existing file the engine may rewrite: exe, asar and the frontend JS assets.
+    $files = @((Join-Path $App 'claude.exe'),(Join-Path $App 'resources\app.asar'))
+    $assetDir = Join-Path $App 'resources\ion-dist\assets\v1'
+    if (Test-Path -LiteralPath $assetDir -PathType Container) {
+        $files += @(Get-ChildItem -LiteralPath $assetDir -Filter '*.js' -File -Force | ForEach-Object { $_.FullName })
+    }
+    foreach ($file in $files) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
         try { ([IO.File]::Open($file,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)).Dispose() }
         catch { return $false }
@@ -152,8 +158,21 @@ function Grant-InstallWriteAccess([string]$Root) {
     if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) {
         New-Item -ItemType Directory -Force -Path (Split-Path $aclBackup -Parent) | Out-Null
         Info "Saving original ACL to $aclBackup"
-        & icacls.exe $Root /save $aclBackup /T /C /Q | Out-Null
-        if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { throw "Could not save the original ACL (icacls exit $LASTEXITCODE); no permissions were changed." }
+        # No /C: icacls stops at the first item it cannot read, so exit 0 means every item was saved.
+        & icacls.exe $Root /save $aclBackup /T /Q | Out-Null
+        $saveExit = $LASTEXITCODE
+        $saved = 0
+        if (Test-Path -LiteralPath $aclBackup -PathType Leaf) {
+            # The save file is UTF-16LE: one line with the item path, one with its SDDL.
+            $lines = @([IO.File]::ReadAllLines($aclBackup,[Text.Encoding]::Unicode) | Where-Object { $_.Trim() })
+            $saved = [int][Math]::Floor($lines.Count / 2)
+        }
+        $expected = 1 + @(Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction Stop).Count
+        if ($saveExit -ne 0 -or $saved -lt $expected) {
+            if (Test-Path -LiteralPath $aclBackup) { Remove-Item -LiteralPath $aclBackup -Force }
+            throw "Could not save a complete ACL backup (icacls exit $saveExit, saved $saved of $expected items); no permissions were changed."
+        }
+        $script:AclGrantedThisRun = $true
     }
     Info 'Taking ownership of the Claude installation for Administrators...'
     & takeown.exe /F $Root /A /R /D Y | Out-Null
@@ -165,7 +184,7 @@ function Grant-InstallWriteAccess([string]$Root) {
 }
 function Restore-InstallAcl([string]$Root) {
     $aclBackup = Get-AclBackupPath $Root
-    if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { return }
+    if (-not (Test-Path -LiteralPath $aclBackup -PathType Leaf)) { return $true }
     Info 'Restoring original ACL and TrustedInstaller ownership...'
     & icacls.exe (Split-Path $Root -Parent) /restore $aclBackup /C /Q | Out-Null
     $restoreExit = $LASTEXITCODE
@@ -174,9 +193,10 @@ function Restore-InstallAcl([string]$Root) {
     if ($restoreExit -eq 0 -and $ownerExit -eq 0) {
         Remove-Item -LiteralPath $aclBackup -Force
         Info 'Original permissions restored.'
-    } else {
-        Write-Warning "Permission restore incomplete (restore exit $restoreExit, setowner exit $ownerExit). ACL backup kept: $aclBackup"
+        return $true
     }
+    Write-Host "ERROR: Permission restore incomplete (restore exit $restoreExit, setowner exit $ownerExit). ACL backup kept: $aclBackup" -ForegroundColor Red
+    return $false
 }
 function Check-Manifest([string]$Root) {
     $manifestPath = Join-Path $Root 'AppxManifest.xml'
@@ -188,6 +208,7 @@ function Check-Manifest([string]$Root) {
     if ($manifest.Package.Identity.ProcessorArchitecture -ne 'x64') { throw 'Only x64 was verified.' }
 }
 $exitCode = 0
+$script:AclGrantedThisRun = $false
 try {
     if ($Restore -and $CheckOnly) { throw '-Restore cannot be combined with -CheckOnly.' }
     if (-not $CheckOnly -and -not (Test-IsAdmin)) {
@@ -215,13 +236,7 @@ try {
         else { $NodePath = 'skipped'; $skipSyntax = $true; Write-Warning 'Node.js was not found; skipping JavaScript syntax verification.' }
     }
     Info "Target current Claude installation: $InstallDir"
-    if (-not $CheckOnly) {
-        Stop-TargetClaude $AppDir
-        if (-not (Test-InstallWritable $InstallDir $AppDir)) {
-            if ($NoAclChange) { Write-Warning 'Installation is not writable and -NoAclChange was given; the engine will report the failure.' }
-            else { Grant-InstallWriteAccess $InstallDir }
-        }
-    }
+    if (-not $CheckOnly) { Stop-TargetClaude $AppDir }
 
     # Backend is embedded to keep the patch engine in a single PS1.
     $backend = @'
@@ -794,6 +809,21 @@ if __name__=='__main__':
     except Exception as exc:log('ERROR: '+str(exc));sys.exit(1)
 
 '@
+    if (-not $CheckOnly) {
+        if (-not $Restore) {
+            # Read-only compatibility gate before any ownership/ACL change, so an
+            # unsupported build never leaves the install with altered permissions.
+            if ($backend -notmatch "(?m)^VERSION = '([^']+)'") { throw 'Cannot read the supported version from the patch engine.' }
+            $supportedVersion = $Matches[1]
+            [xml]$manifestXml = Get-Content -LiteralPath (Join-Path $InstallDir 'AppxManifest.xml') -Raw
+            $installedVersion = [string]$manifestXml.Package.Identity.Version
+            if ($installedVersion -ne $supportedVersion) { throw "Unsupported Claude version: $installedVersion; expected $supportedVersion. No permissions or application files changed." }
+        }
+        if (-not (Test-InstallWritable $InstallDir $AppDir)) {
+            if ($NoAclChange) { Write-Warning 'Installation is not writable and -NoAclChange was given; the engine will report the failure.' }
+            else { Grant-InstallWriteAccess $InstallDir }
+        }
+    }
     $tempScript = Join-Path ([IO.Path]::GetTempPath()) ('claude-patch-' + [Guid]::NewGuid().ToString('N') + '.py')
     [IO.File]::WriteAllText($tempScript,$backend,[Text.UTF8Encoding]::new($false))
     $oldEncoding = $env:PYTHONIOENCODING
@@ -809,7 +839,9 @@ if __name__=='__main__':
         $env:PYTHONIOENCODING = $oldEncoding
         if (Test-Path -LiteralPath $tempScript) { Remove-Item -LiteralPath $tempScript -Force }
     }
-    if ($Restore) { if (-not $NoAclChange) { Restore-InstallAcl $InstallDir } }
+    if ($Restore) {
+        if (-not $NoAclChange -and -not (Restore-InstallAcl $InstallDir)) { $exitCode = 1 }
+    }
     elseif (-not $CheckOnly) {
         Info 'Current Claude installation patched. Start Claude and create a new session for session settings to take effect.'
         Info ('Restore resources: powershell -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Restore -InstallDir "' + $InstallDir + '"')
@@ -817,6 +849,12 @@ if __name__=='__main__':
 } catch {
     Write-Host ('ERROR: ' + $_.Exception.Message) -ForegroundColor Red
     $exitCode = 1
+    # Permissions changed by this run but the patch did not complete (the engine
+    # rolls back its own file writes): put the original ACL back.
+    if ($script:AclGrantedThisRun -and -not $Restore) {
+        Info 'Patch did not complete; reverting the permission changes made by this run.'
+        try { $null = Restore-InstallAcl $InstallDir } catch { Write-Host ('ERROR: ACL revert failed: ' + $_.Exception.Message) -ForegroundColor Red }
+    }
 }
 if ($ElevatedChild) { $null = Read-Host 'Press Enter to close this window' }
 exit $exitCode
