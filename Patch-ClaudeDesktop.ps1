@@ -141,6 +141,30 @@ def sha(b): return hashlib.sha256(b).hexdigest()
 def dump(o): return json.dumps(o, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 def log(s): print(s, flush=True)
 
+# Never use tempfile.TemporaryFile/NamedTemporaryFile/mkstemp inside the Claude
+# installation directory. On Windows, CPython's tempfile retries every
+# PermissionError while os.access(dir, W_OK) is true, and os.access only checks
+# the read-only attribute, not ACLs. In an ACL-protected WindowsApps folder each
+# create is denied, so tempfile loops up to os.TMP_MAX (2147483647 on Windows)
+# times and the script appears to hang for hours. These helpers make one create
+# per candidate name and let PermissionError surface immediately.
+_O_BINARY = getattr(os, 'O_BINARY', 0)
+
+def create_exclusive(directory, prefix, attempts=100):
+    for _ in range(attempts):
+        name = os.path.join(str(directory), prefix + os.urandom(8).hex())
+        try:
+            fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BINARY, 0o600)
+        except FileExistsError:
+            continue
+        return fd, pathlib.Path(name)
+    raise FileExistsError('No usable staging file name found in ' + str(directory))
+
+def probe_writable_dir(directory):
+    fd, path = create_exclusive(directory, '.claude-patch-probe-')
+    os.close(fd)
+    path.unlink()
+
 def sha_file(path, chunk=1 << 20):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -546,10 +570,11 @@ def main():
         else: legacy_backup.rename(backup)
     if not args.check_only:
         # Check directory creation and existing-file writes before changing resources.
+        log('Checking write access to the Claude installation...')
         try:
             targets=[app/'claude.exe',app/'resources/app.asar',* (app/'resources/ion-dist/assets/v1').glob('*.js')]
             for directory in {app.parent,*(path.parent for path in targets)}:
-                with tempfile.TemporaryFile(dir=directory): pass
+                probe_writable_dir(directory)
             for path in targets:
                 with path.open('r+b'): pass
             backup.mkdir(parents=True,exist_ok=True)
@@ -573,6 +598,7 @@ def main():
         fa_path=app/fa['path'] if isinstance(fa.get('path'),str) else None
         exe_path=app/'claude.exe'
         asar_path=app/'resources/app.asar'
+        if prev: log('Checking whether the installed files already match this patch build...')
         if (prev and not prev.get('resourcesRestored')
                 and prev.get('engineSHA256')==engine_id
                 and not (not args.skip_syntax_check and prev.get('syntaxCheckSkipped'))
@@ -645,11 +671,10 @@ def main():
         try:
             for path,data in writes.items():
                 path.parent.mkdir(parents=True,exist_ok=True)
-                with tempfile.NamedTemporaryFile(dir=path.parent,prefix=path.name+'.patch-',delete=False) as handle:
-                    temp=pathlib.Path(handle.name);staged.append((temp,path));handle.write(data)
+                fd,temp=create_exclusive(path.parent,path.name+'.patch-');staged.append((temp,path))
+                with os.fdopen(fd,'wb') as handle:handle.write(data)
             asar_path=app/'resources/app.asar'
-            with tempfile.NamedTemporaryFile(dir=asar_path.parent,prefix=asar_path.name+'.patch-',delete=False) as handle:
-                asar_stage=pathlib.Path(handle.name)
+            fd,asar_stage=create_exclusive(asar_path.parent,asar_path.name+'.patch-');os.close(fd)
             staged.append((asar_stage,asar_path))
             shutil.copyfile(final_tmp,asar_stage)
             for temp,path in staged:
