@@ -326,11 +326,14 @@ function Restore-InstallAcl([string]$Root) {
     Write-Host "ERROR: Permission restore incomplete (restore exit $restoreExit, setowner exit $ownerExit). ACL backup kept: $aclBackup" -ForegroundColor Red
     return $false
 }
+# Package identity names Claude Desktop has shipped under. Current Store/MSIX
+# builds register as 'AnthropicPBC.Claude'; older sideloaded builds used 'Claude'.
+$ClaudePackageNames = @('AnthropicPBC.Claude','Claude')
 function Check-Manifest([string]$Root) {
     $manifestPath = Join-Path $Root 'AppxManifest.xml'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'AppxManifest.xml is missing.' }
     [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
-    if ($manifest.Package.Identity.Name -ne 'Claude') {
+    if ($ClaudePackageNames -notcontains [string]$manifest.Package.Identity.Name) {
         throw 'The selected package is not Claude.'
     }
     if ($manifest.Package.Identity.ProcessorArchitecture -ne 'x64') { throw 'Only x64 was verified.' }
@@ -349,12 +352,17 @@ try {
         if ($ElevatedChild) { throw 'Elevation did not produce an administrator session.' }
         exit (Invoke-SelfElevated $PSBoundParameters)
     }
-    $installed = @(Get-AppxPackage -Name Claude -ErrorAction Stop)
+    $registered = @(foreach ($name in $ClaudePackageNames) { Get-AppxPackage -Name $name -ErrorAction Stop })
+    $installed = @($registered | Where-Object { $_.InstallLocation })
     if ($InstallDir) {
         $InstallDir = (Resolve-Path -LiteralPath $InstallDir).Path.TrimEnd('\')
         $installed = @($installed | Where-Object { $_.InstallLocation.TrimEnd('\') -eq $InstallDir })
     }
-    if ($installed.Count -ne 1) { throw 'Expected one registered Claude installation for the current user. If multiple exist, select one with -InstallDir.' }
+    if ($installed.Count -ne 1) {
+        $found = if ($registered.Count) { ($registered | ForEach-Object { "$($_.Name) $($_.Version) [$($_.InstallLocation)]" }) -join '; ' } else { 'none' }
+        if ($installed.Count -eq 0) { throw "No registered Claude installation matched for the current user (found: $found). Package names checked: $($ClaudePackageNames -join ', ')." }
+        throw "Expected one registered Claude installation for the current user, found $($installed.Count): $found. Select one with -InstallDir."
+    }
     $InstallDir = $installed[0].InstallLocation
     Check-Manifest $InstallDir
     $AppDir = Join-Path $InstallDir 'app'
