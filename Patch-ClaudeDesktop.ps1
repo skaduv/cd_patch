@@ -60,8 +60,14 @@ function Resolve-Python([string]$Given) {
 }
 function Resolve-Node([string]$Given) {
     # Returns the node.exe path, or $null when none is available (caller warns and skips).
+    # An explicitly given path must be a file: silently falling back would ignore
+    # the user's explicit choice.
+    if ($Given) {
+        $p = (Resolve-Path -LiteralPath $Given -ErrorAction Stop).Path
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "The Node.js path '$p' is not a file." }
+        return $p
+    }
     $candidates = @()
-    if ($Given) { $candidates += (Resolve-Path -LiteralPath $Given -ErrorAction Stop).Path }
     $found = Get-Command node.exe -ErrorAction SilentlyContinue
     if ($found) { $candidates += $found.Source }
     $candidates += 'D:\nodejs\node.exe'

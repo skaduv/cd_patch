@@ -16,7 +16,7 @@
 - **遥测**：默认启用 `disableEssentialTelemetry` 和 `disableNonessentialTelemetry`，在 1p 模式中强制关闭对应遥测，并设置 Code 子进程禁用遥测、错误报告的环境变量。
 - **备份与恢复**：修改前自动备份，恢复前后校验 SHA256。
 - **离线设置入口**：主窗口顶部保留 40px 本地菜单栏，左上角菜单不依赖官网登录页加载；通过“文件 → Configure Third-Party Inference…”打开内置第三方 API 配置页，地区不可用或断网时也能进入。配置页可离线填写，验证凭据和调用模型仍需连接对应提供方。
-- **重复运行秒退**：检测到 `patch-report.json` 记录的补丁已应用（EXE 内已含本次构建哈希）时直接退出，不重复走全流程。
+- **重复运行秒退**：仅当以下全部成立时直接退出：`patch-report.json` 未被恢复过、补丁引擎指纹（`engineSHA256`）与当前一致、EXE / 当前 ASAR / 前端 asset 的完整 SHA256 与报告记录一致；若上次跳过了语法校验而本次需要校验，则不走跳过、重新执行。
 - **进度与诊断输出**：ASAR 校验/重建按 64MB 打进度；启动时打印实际使用的 Python/Node 路径与版本；结束 Claude 进程时打印数量。Python 会做真实 `--version` 探测，Microsoft Store 占位符会被识别并跳过。
 
 自动发现、工具搜索、WebFetch 预检跳过和内置浏览器设置允许显式 `false` 关闭；1p 遥测使用强制覆盖。
