@@ -367,13 +367,13 @@ function Save-LanguageCatalogsWithBrowser([string]$Directory, [string[]]$Names) 
     $fetcher = @'
 // Fetch claude.ai catalogs through a real Edge/Chrome so Cloudflare's browser
 // challenge is solved the same way it is in the user's own browser.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 const [browser, outDir, ...files] = process.argv.slice(2);
-const origin = process.env.CLAUDE_I18N_ORIGIN || 'https://claude.ai';
+const origin = 'https://claude.ai';
 const base = origin + '/i18n/';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 if (typeof WebSocket !== 'function') { console.error('ERROR: Node.js 22 or newer is needed for the browser download.'); process.exit(2); }
@@ -383,26 +383,44 @@ async function session(headless) {
   const args = ['--remote-debugging-port=0', '--user-data-dir=' + profile, '--no-first-run', '--no-default-browser-check',
     '--disable-extensions', '--disable-sync', '--window-size=640,480', 'about:blank'];
   if (headless) args.unshift('--headless=new');
-  if (process.env.CDP_EXTRA_ARGS) args.unshift(...process.env.CDP_EXTRA_ARGS.split(' '));
+  let spawnError = null;
   const proc = spawn(browser, args, { stdio: 'ignore' });
-  const cleanup = async () => { try { proc.kill(); } catch {} await sleep(800); try { fs.rmSync(profile, { recursive: true, force: true }); } catch {} };
+  proc.on('error', (e) => { spawnError = e; });
+  const cleanup = async () => {
+    // Edge/Chrome start helper processes that keep the profile locked, so end
+    // the whole tree before removing the temporary profile.
+    if (proc.pid && proc.exitCode === null) {
+      if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore' });
+      else { try { proc.kill('SIGKILL'); } catch {} }
+    }
+    await sleep(1000);
+    try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }); }
+    catch (e) { console.log('Note: could not remove temporary browser profile ' + profile + ' (' + e.code + ')'); }
+  };
   try {
     let port;
-    for (let i = 0; i < 100 && !port; i++) {
+    for (let i = 0; i < 100 && !port && !spawnError; i++) {
       await sleep(200);
       try { port = fs.readFileSync(path.join(profile, 'DevToolsActivePort'), 'utf8').split(/\r?\n/)[0]; } catch {}
     }
+    if (spawnError) {
+      const why = spawnError.code === 'ENOENT' ? 'browser executable not found' : (spawnError.code === 'EACCES' || spawnError.code === 'EPERM') ? 'browser could not be started (' + spawnError.code + ')' : 'browser failed to start (' + (spawnError.code || spawnError.message) + ')';
+      throw new Error(why);
+    }
     if (!port) throw new Error('browser did not start');
-    const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
-    const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(10000) })).json();
+    const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(10000) })).json();
     const page = targets.find((t) => t.type === 'page');
     if (!page) throw new Error('no browser tab');
     const ws = new WebSocket(page.webSocketDebuggerUrl);
     await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('cannot connect to browser')); });
     let id = 0; const pending = new Map();
     ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); } };
+    ws.onclose = () => { for (const done of pending.values()) done({ error: { message: 'browser connection closed' } }); pending.clear(); };
     const send = (method, params = {}) => new Promise((res, rej) => {
-      const n = ++id; pending.set(n, (m) => (m.error ? rej(new Error(m.error.message)) : res(m.result)));
+      const n = ++id;
+      const timer = setTimeout(() => { pending.delete(n); rej(new Error(method + ' timed out')); }, 90000);
+      pending.set(n, (m) => { clearTimeout(timer); m.error ? rej(new Error(m.error.message)) : res(m.result); });
       ws.send(JSON.stringify({ id: n, method, params }));
     });
     const evaluate = async (expression) => (await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true })).result.value;
@@ -419,7 +437,7 @@ async function session(headless) {
     if (!ready) throw new Error('Cloudflare check did not clear');
     const got = {};
     for (const name of files) {
-      const r = await evaluate(`fetch(${JSON.stringify(base + name)}, {credentials: 'include', cache: 'no-store'})
+      const r = await evaluate(`fetch(${JSON.stringify(base + name)}, {credentials: 'include', cache: 'no-store', signal: AbortSignal.timeout(60000)})
         .then(async (r) => ({ status: r.status, type: r.headers.get('content-type') || '', text: r.ok ? await r.text() : '' }))
         .catch((e) => ({ status: 0, type: '', text: '', error: String(e) }))`);
       got[name] = r;
