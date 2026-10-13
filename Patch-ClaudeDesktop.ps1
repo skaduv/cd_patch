@@ -565,6 +565,7 @@ def apply_pre_patch(data, report):
     text = patch_discovery_default(text, 'preload model discovery default true', report)
     text = patch_telemetry_defaults(text, 'preload', report)
     text = patch_browser_default(text, 'preload', report)
+    text = patch_inference_http_bundle(text, 'preload', report)
     text = patch_local_features(text, 'preload', report)
     text = patch_effective_telemetry(text, 'preload', report, startup=True)
     return text.encode('utf8')
@@ -764,6 +765,25 @@ def patch_browser_default(text,label,report):
     pattern=r'(flatKey:"builtinBrowserEnabled",support:\{enabled:\{scopes:\["3p"\],availableInVersion:"2\.2553\.0"\},executionTarget:"desktop"\},title:[^\n]*?,default:)!1(?=,remotePolicy:)'
     return once(text,pattern,lambda m:m[1]+'!0',label+' browser default true',report)
 
+# Third-party inference base URLs (gateway, Bedrock, Vertex, Foundry) share the
+# URL schema that only allows http on loopback. Give those four fields a schema
+# from the same factory with allowHttp, leaving MCP/OAuth/other URLs unchanged.
+LOOPBACK_URL_SCHEMA=r'var ([\w$]+)=([\w$]+)\(\{allowLoopbackHttp:!0\}\)'
+INFERENCE_BASE_URL=r'([\w$]+)\.optional\(\)(,\{redact:"hostname"\}\),\{flatKey:"inference(?:Gateway|Bedrock|Vertex|Foundry)BaseUrl")'
+HTTP_URL_EXPORT='__cdpHttpUrl'
+
+def patch_inference_base_urls(text,label,report,schema,expected=None):
+    found={m[1] for m in re.finditer(INFERENCE_BASE_URL,text)}
+    if len(found)!=1 or (expected is not None and found!={expected}):
+        raise ValueError(label+' inference base URLs: unexpected URL schema; unsupported build')
+    return once(text,INFERENCE_BASE_URL,lambda m:schema+'.optional()'+m[2],label+' inference base URLs allow http',report,count=4)
+
+def patch_inference_http_bundle(text,label,report):
+    m=list(re.finditer(LOOPBACK_URL_SCHEMA,text))
+    if len(m)!=1 or not re.search(r'function '+re.escape(m[0][2])+r'\(e=\{\}\)\{',text):
+        raise ValueError(label+' URL schema factory not found; unsupported build')
+    return patch_inference_base_urls(text,label,report,m[0][2]+'({allowHttp:!0})',m[0][1])
+
 def patch_local_features(text,label,report):
     # 2.31226 uses rule descriptors, shared by main and startup bundles.
     # Browser rules still follow builtinBrowserEnabled and its policy check.
@@ -821,6 +841,11 @@ def patch_main(text,report):
     text=patch_discovery_default(text,'main model discovery default true',report)
     text=patch_telemetry_defaults(text,'main',report)
     text=patch_browser_default(text,'main',report)
+    text=patch_inference_http_bundle(text,'main',report)
+    # Dictation reuses the gateway base URL; let it accept http too.
+    text=once(text,r'if\(n\.protocol!=="https:"&&![\w$]+\.has\(n\.hostname\)\|\|n\.hostname\.startsWith\("\["\)\)return null;let r=t\.credential',
+        'if(n.protocol!=="https:"&&n.protocol!=="http:"||n.hostname.startsWith("["))return null;let r=t.credential',
+        'dictation gateway base URL allows http',report)
     # Keep provider compatibility detection (unpinned), and use host tool search
     # for 1p instead of the legacy third-party beta-header path.
     text=once(text,r'!t\.thirdParty\|\|!e\.workspace\.toolSearchEnabled\?"off":e\.inference\?\.provider==="gateway"',
@@ -1001,10 +1026,31 @@ def main():
         front_text=patch_validator(pristine(front[0]),'frontend gateway validator',report)
         front_text=patch_discovery_default(front_text,'frontend model discovery default true',report)
         front_text=patch_telemetry_defaults(front_text,'frontend',report)
-        writes[front[0]]=patch_browser_default(front_text,'frontend',report).encode('utf8')
+        front_text=patch_browser_default(front_text,'frontend',report)
+        # The URL schema factory lives in a shared chunk the frontend imports
+        # from; export an http-capable schema there and import it.
+        fac=[p for p,t in asset_texts.items() if len(re.findall(LOOPBACK_URL_SCHEMA,t))==1]
+        if len(fac)!=1 or fac[0]==front[0]:raise ValueError('Cannot uniquely identify the frontend URL schema module; no files changed')
+        fac_text=asset_texts[fac[0]]
+        if HTTP_URL_EXPORT in fac_text or HTTP_URL_EXPORT in front_text:raise ValueError('Frontend already contains patched URL schema; run -Restore first')
+        loop_var=re.search(LOOPBACK_URL_SCHEMA,fac_text)[1]
+        fac_text=once(fac_text,LOOPBACK_URL_SCHEMA,lambda m:m[0]+','+HTTP_URL_EXPORT+'='+m[2]+'({allowHttp:!0})','frontend http URL schema',report)
+        fac_text=once(fac_text,r'export\{(?=[^{}]*\}\s*;?\s*$)','export{'+HTTP_URL_EXPORT+',','frontend http URL schema export',report)
+        imp=r'import\{([^{}]*)\}from"\./'+re.escape(fac[0].name)+'"'
+        im=list(re.finditer(imp,front_text))
+        if len(im)!=1:raise ValueError('Frontend URL schema import not found; no files changed')
+        alias={a.strip().split(' as ')[-1]:a.strip().split(' as ')[0] for a in im[0][1].split(',') if a.strip()}
+        exp=re.search(r'export\{([^{}]*)\}\s*;?\s*$',asset_texts[fac[0]])
+        em=re.search(r'(?:^|,)\s*'+re.escape(loop_var)+r' as ([\w$]+)\s*(?=,|$)',exp[1]) if exp else None
+        local=[a for a,orig in alias.items() if em and orig==em[1]]
+        if len(local)!=1:raise ValueError('Frontend URL schema alias not found; no files changed')
+        front_text=once(front_text,imp,lambda m:'import{'+HTTP_URL_EXPORT+','+m[1]+'}from"./'+fac[0].name+'"','frontend http URL schema import',report)
+        front_text=patch_inference_base_urls(front_text,'frontend',report,HTTP_URL_EXPORT,local[0])
+        writes[front[0]]=front_text.encode('utf8')
+        writes[fac[0]]=fac_text.encode('utf8')
         front_rel=front[0].relative_to(app).as_posix()
+        def current(path): return writes[path].decode('utf8') if path in writes else asset_texts[path]
         if use_language:
-            def current(path): return writes[path].decode('utf8') if path in writes else asset_texts[path]
             locale_assets=[p for p in asset_texts if re.search(LOCALE_LIST,asset_texts[p])]
             if len(locale_assets)!=1:raise ValueError(f'Cannot uniquely identify the frontend supported-locale lists (found {len(locale_assets)} files); no files changed')
             text,hits=add_zh_locale(current(locale_assets[0]))
