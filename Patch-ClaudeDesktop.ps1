@@ -367,7 +367,8 @@ function Save-LanguageCatalogs([string]$Directory) {
             } catch {
                 $lastError = $_.Exception.Message
                 if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
-                if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { break }
+                $response = $_.Exception.PSObject.Properties['Response']
+                if ($response -and $response.Value -and ($response.Value.PSObject.Properties['StatusCode']) -and [int]$response.Value.StatusCode -eq 404) { break }
                 Start-Sleep -Seconds $attempt
             }
         }
@@ -377,6 +378,38 @@ function Save-LanguageCatalogs([string]$Directory) {
             }
             Write-Warning "Skipping optional catalog $name ($lastError); missing strings stay English."
         }
+    }
+    # Validate the catalogs the same way the engine does (a JSON object of
+    # string keys and values; zh-Hans.json non-empty) before Claude is stopped
+    # or permissions change. Invalid optional catalogs are dropped.
+    $validator = @'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for name, required in (('zh-Hans.json', True), ('dynamic/zh-Hans.json', False), ('zh-Hans.overrides.json', False)):
+    path = root / name
+    if not path.is_file():
+        continue
+    try:
+        value = json.loads(path.read_bytes())
+        ok = isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()) and (bool(value) or not required)
+    except Exception:
+        ok = False
+    if ok:
+        continue
+    if required:
+        print('INVALID ' + name)
+        sys.exit(1)
+    path.unlink()
+    print('WARNING: Skipping invalid optional catalog ' + name + '; missing strings stay English.')
+'@
+    $validatorPath = Join-Path $Directory 'validate-catalogs.py'
+    [IO.File]::WriteAllText($validatorPath,$validator,[Text.UTF8Encoding]::new($false))
+    try {
+        & $PythonPath $validatorPath $Directory
+        $validateExit = $LASTEXITCODE
+    } finally { Remove-Item -LiteralPath $validatorPath -Force -ErrorAction SilentlyContinue }
+    if ($validateExit -ne 0) {
+        throw ("Downloaded $base" + "zh-Hans.json is not a valid non-empty language catalog. Use -LanguageDir with an offline copy or -NoLanguage to skip Chinese. No permissions or application files changed.")
     }
 }
 # Package identity names Claude Desktop has shipped under. Current Store/MSIX
