@@ -313,8 +313,27 @@ function Restore-InstallAcl([string]$Root) {
         return $false
     }
     Info 'Restoring original ACL and per-item ownership...'
-    & icacls.exe (Split-Path $Root -Parent) /restore $aclBackup /C /Q | Out-Null
-    $restoreExit = $LASTEXITCODE
+    # icacls /save also records the SACL section (labels such as the package's
+    # process trust label). An administrator cannot write those, so /restore of
+    # a line with an S: section fails with Access is denied for the whole item.
+    # Restore only the DACL, which is all this script changed.
+    $daclOnly = $aclBackup + '.dacl'
+    $restoreLines = @([IO.File]::ReadAllLines($aclBackup,[Text.Encoding]::Unicode) | Where-Object { $_.Trim() })
+    for ($i = 1; $i -lt $restoreLines.Count; $i += 2) {
+        # Cut at the first S: section tag outside an ACE's parentheses, so SIDs
+        # and conditional expressions inside the DACL are never touched.
+        $line = $restoreLines[$i]; $depth = 0
+        for ($k = 0; $k -lt $line.Length - 1; $k++) {
+            $ch = $line[$k]
+            if ($ch -eq '(') { $depth++ } elseif ($ch -eq ')') { $depth-- }
+            elseif ($depth -eq 0 -and $ch -eq 'S' -and $line[$k + 1] -eq ':') { $restoreLines[$i] = $line.Substring(0,$k); break }
+        }
+    }
+    [IO.File]::WriteAllLines($daclOnly,[string[]]$restoreLines,[Text.UnicodeEncoding]::new($false,$true))
+    try {
+        & icacls.exe (Split-Path $Root -Parent) /restore $daclOnly /C /Q | Out-Null
+        $restoreExit = $LASTEXITCODE
+    } finally { Remove-Item -LiteralPath $daclOnly -Force -ErrorAction SilentlyContinue }
     $ownerExit = Restore-InstallOwners $Root ($aclBackup + '.owners')
     if ($restoreExit -eq 0 -and $ownerExit -eq 0) {
         Remove-Item -LiteralPath $aclBackup -Force
@@ -325,6 +344,73 @@ function Restore-InstallAcl([string]$Root) {
     }
     Write-Host "ERROR: Permission restore incomplete (restore exit $restoreExit, setowner exit $ownerExit). ACL backup kept: $aclBackup" -ForegroundColor Red
     return $false
+}
+function Save-LanguageCatalogs([string]$Directory) {
+    # Use the Windows network stack (system proxy, Schannel TLS) rather than
+    # Python's urllib, which ignores some proxy setups and fails TLS through
+    # them. zh-Hans.json is required; the dynamic and override catalogs are
+    # optional and often refused by Cloudflare, so they are skipped on failure.
+    $base = 'https://claude.ai/i18n/'
+    $files = [ordered]@{ 'zh-Hans.json' = $true; 'dynamic/zh-Hans.json' = $false; 'zh-Hans.overrides.json' = $false }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    $headers = @{ 'Accept' = 'application/json, */*'; 'Referer' = 'https://claude.ai/'; 'Accept-Language' = 'zh-CN,zh;q=0.9,en;q=0.8' }
+    $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36'
+    Info ('Downloading official Simplified Chinese catalogs from ' + $base + ' ...')
+    foreach ($name in $files.Keys) {
+        $target = Join-Path $Directory ($name -replace '/','\')
+        New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent) | Out-Null
+        $lastError = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Invoke-WebRequest -Uri ($base + $name) -UseBasicParsing -UserAgent $ua -Headers $headers -TimeoutSec 60 -OutFile $target -ErrorAction Stop
+                $lastError = $null; break
+            } catch {
+                $lastError = $_.Exception.Message
+                if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
+                $response = $_.Exception.PSObject.Properties['Response']
+                if ($response -and $response.Value -and ($response.Value.PSObject.Properties['StatusCode']) -and [int]$response.Value.StatusCode -eq 404) { break }
+                Start-Sleep -Seconds $attempt
+            }
+        }
+        if ($lastError) {
+            if ($files[$name]) {
+                throw ("Cannot download $base$name ($lastError). Check the network or proxy, or use -LanguageDir with an offline copy, or -NoLanguage to skip Chinese. No permissions or application files changed.")
+            }
+            Write-Warning "Skipping optional catalog $name ($lastError); missing strings stay English."
+        }
+    }
+    # Validate the catalogs the same way the engine does (a JSON object of
+    # string keys and values; zh-Hans.json non-empty) before Claude is stopped
+    # or permissions change. Invalid optional catalogs are dropped.
+    $validator = @'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for name, required in (('zh-Hans.json', True), ('dynamic/zh-Hans.json', False), ('zh-Hans.overrides.json', False)):
+    path = root / name
+    if not path.is_file():
+        continue
+    try:
+        value = json.loads(path.read_bytes())
+        ok = isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()) and (bool(value) or not required)
+    except Exception:
+        ok = False
+    if ok:
+        continue
+    if required:
+        print('INVALID ' + name)
+        sys.exit(1)
+    path.unlink()
+    print('WARNING: Skipping invalid optional catalog ' + name + '; missing strings stay English.')
+'@
+    $validatorPath = Join-Path $Directory 'validate-catalogs.py'
+    [IO.File]::WriteAllText($validatorPath,$validator,[Text.UTF8Encoding]::new($false))
+    try {
+        & $PythonPath $validatorPath $Directory
+        $validateExit = $LASTEXITCODE
+    } finally { Remove-Item -LiteralPath $validatorPath -Force -ErrorAction SilentlyContinue }
+    if ($validateExit -ne 0) {
+        throw ("Downloaded $base" + "zh-Hans.json is not a valid non-empty language catalog. Use -LanguageDir with an offline copy or -NoLanguage to skip Chinese. No permissions or application files changed.")
+    }
 }
 # Package identity names Claude Desktop has shipped under. Current Store/MSIX
 # builds register as 'AnthropicPBC.Claude'; older sideloaded builds used 'Claude'.
@@ -340,6 +426,7 @@ function Check-Manifest([string]$Root) {
 }
 $exitCode = 0
 $script:AclGrantedThisRun = $false
+$script:FetchedLanguageDir = $null
 try {
     if ($Restore -and $CheckOnly) { throw '-Restore cannot be combined with -CheckOnly.' }
     if ($NoLanguage -and $LanguageDir) { throw '-NoLanguage cannot be combined with -LanguageDir.' }
@@ -419,7 +506,8 @@ def add_zh_locale(text):
     return re.subn(LOCALE_LIST, lambda m: m[0][:-1] + ',"' + LANGUAGE_CODE + '"]', text)
 
 def fetch_language(url):
-    request = urllib.request.Request(url, headers={'User-Agent': BROWSER_UA, 'Accept': 'application/json'})
+    request = urllib.request.Request(url, headers={'User-Agent': BROWSER_UA, 'Accept': 'application/json, */*',
+        'Referer': 'https://claude.ai/', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
     for attempt in range(3):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -459,6 +547,11 @@ def merged_catalogs(resources, directory=None):
             try:
                 data = fetch_language(LANGUAGE_SOURCE + target)
             except Exception as exc:
+                if not required:
+                    # Optional catalogs (dynamic strings, overrides) are often
+                    # refused by Cloudflare; English fallbacks fill the gaps.
+                    log('WARNING: Skipping optional catalog ' + target + ' (' + str(exc) + '); missing strings stay English.')
+                    continue
                 raise ValueError('Cannot download ' + LANGUAGE_SOURCE + target + ' (' + str(exc) + '). '
                     'Use -LanguageDir with an offline copy or -NoLanguage to skip Chinese. No application files changed.') from exc
         if data is None:
@@ -924,6 +1017,7 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--app',required=True)
     p.add_argument('--node',required=True);p.add_argument('--check-only',action='store_true');p.add_argument('--restore',action='store_true');p.add_argument('--skip-syntax-check',action='store_true')
     p.add_argument('--language',default='');p.add_argument('--no-language',action='store_true')
+    p.add_argument('--language-downloaded',action='store_true')
     args=p.parse_args();app=pathlib.Path(args.app).resolve()
     if not (app/'resources/app.asar').is_file():raise ValueError('Not a Claude app directory')
     manifest=app.parent/'AppxManifest.xml'
@@ -1085,7 +1179,7 @@ def main():
             'frontendAsset':{'path':front_rel,'sha256':sha(writes[front[0]])},
             'writtenFiles':{p.relative_to(app).as_posix():sha(b) for p,b in writes.items() if p!=front[0]},
             'language':language_report,'languageCode':LANGUAGE_CODE if use_language else None,
-            'languageSource':(args.language or LANGUAGE_SOURCE) if use_language else None,
+            'languageSource':(LANGUAGE_SOURCE if args.language_downloaded or not args.language else args.language) if use_language else None,
             'languageSourceSHA256':language_sources}
         if args.check_only:
             log(json.dumps(report_obj,ensure_ascii=False,indent=2));log('CHECK ONLY: no application files changed.');return
@@ -1153,6 +1247,12 @@ if __name__=='__main__':
             $installedVersion = [string]$manifestXml.Package.Identity.Version
             if ($installedVersion -ne $supportedVersion) { throw "Unsupported Claude version: $installedVersion; expected $supportedVersion. No permissions or application files changed." }
         }
+        if (-not $Restore -and -not $NoLanguage -and -not $LanguageDir) {
+            # Download the language catalogs before stopping Claude or changing
+            # permissions, so a refused download leaves everything untouched.
+            $script:FetchedLanguageDir = Join-Path ([IO.Path]::GetTempPath()) ('claude-zh-hans-' + [Guid]::NewGuid().ToString('N'))
+            Save-LanguageCatalogs $script:FetchedLanguageDir
+        }
         # Only stop Claude once the build is known to be supported.
         Stop-TargetClaude $AppDir
         if (-not (Test-InstallWritable $InstallDir $AppDir)) {
@@ -1171,6 +1271,7 @@ if __name__=='__main__':
         if ($skipSyntax) { $engineArgs += '--skip-syntax-check' }
         if ($NoLanguage) { $engineArgs += '--no-language' }
         elseif ($LanguageDir) { $engineArgs += @('--language',$LanguageDir) }
+        elseif ($script:FetchedLanguageDir) { $engineArgs += @('--language',$script:FetchedLanguageDir,'--language-downloaded') }
         & $PythonPath @engineArgs
         if ($LASTEXITCODE -ne 0) { throw 'Patch engine failed. See the diagnostic above.' }
     } finally {
@@ -1197,5 +1298,6 @@ if __name__=='__main__':
         try { $null = Restore-InstallAcl $InstallDir } catch { Write-Host ('ERROR: ACL revert failed: ' + $_.Exception.Message) -ForegroundColor Red }
     }
 }
+if ($script:FetchedLanguageDir -and (Test-Path -LiteralPath $script:FetchedLanguageDir)) { Remove-Item -LiteralPath $script:FetchedLanguageDir -Recurse -Force -ErrorAction SilentlyContinue }
 if ($ElevatedChild) { $null = Read-Host 'Press Enter to close this window' }
 exit $exitCode
