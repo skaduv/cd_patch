@@ -9,6 +9,7 @@
 下文的 **1p** 指 Claude 官方服务模式，**3p** 指第三方推理提供方模式。
 
 - **模型名称**：Gateway/Mantle 接受非空且不含控制字符的模型 ID，保留原始 ID。
+- **http Base URL**：第三方推理的 Base URL（Gateway、Bedrock、Vertex、Foundry）允许任意主机的 `http://`，不再报 “must use https (or http on loopback)”；语音输入复用 Gateway 地址时同样放行。MCP、OAuth 等其他地址仍保持原有 https 校验。注意 http 会明文传输 API 密钥，仅建议在内网或本机使用。
 - **模型发现**：默认启用 Gateway 自动发现，移除发现结果中的厂商名称过滤，按原始 ID 去重，并与手填模型清单合并；保留分页、部分失败结果及认证检查。
 - **Computer Use / Browser Use**：适配新版主进程与启动阶段的本地规则表，默认开启内置浏览器；保留显式关闭、组织策略、系统权限、授权有效期和服务可用性检查。
 - **工具搜索**：默认启用 `toolSearchEnabled`，1p 使用 host 模式并向 Code 子进程传递开关；3p 保留新版 host、legacy 和提供方兼容模式的选择逻辑。
