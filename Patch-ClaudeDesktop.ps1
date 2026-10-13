@@ -345,6 +345,124 @@ function Restore-InstallAcl([string]$Root) {
     Write-Host "ERROR: Permission restore incomplete (restore exit $restoreExit, setowner exit $ownerExit). ACL backup kept: $aclBackup" -ForegroundColor Red
     return $false
 }
+function Find-ChromiumBrowser {
+    $roots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:LOCALAPPDATA) | Where-Object { $_ }
+    foreach ($relative in 'Microsoft\Edge\Application\msedge.exe','Google\Chrome\Application\chrome.exe') {
+        foreach ($root in $roots) {
+            $candidate = Join-Path $root $relative
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        }
+    }
+    foreach ($exe in 'msedge.exe','chrome.exe') {
+        $item = Get-ItemProperty -LiteralPath ('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\' + $exe) -ErrorAction SilentlyContinue
+        if ($item -and $item.PSObject.Properties['(default)'] -and (Test-Path -LiteralPath $item.'(default)' -PathType Leaf)) { return $item.'(default)' }
+    }
+    return $null
+}
+function Save-LanguageCatalogsWithBrowser([string]$Directory, [string[]]$Names) {
+    # Returns $null on success, otherwise a short reason.
+    if (-not $NodePath -or $NodePath -eq 'skipped' -or -not (Test-Path -LiteralPath $NodePath -PathType Leaf)) { return 'Node.js 22+ is needed for the browser download' }
+    $browser = Find-ChromiumBrowser
+    if (-not $browser) { return 'Microsoft Edge or Google Chrome not found' }
+    $fetcher = @'
+// Fetch claude.ai catalogs through a real Edge/Chrome so Cloudflare's browser
+// challenge is solved the same way it is in the user's own browser.
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const [browser, outDir, ...files] = process.argv.slice(2);
+const origin = process.env.CLAUDE_I18N_ORIGIN || 'https://claude.ai';
+const base = origin + '/i18n/';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+if (typeof WebSocket !== 'function') { console.error('ERROR: Node.js 22 or newer is needed for the browser download.'); process.exit(2); }
+
+async function session(headless) {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-i18n-'));
+  const args = ['--remote-debugging-port=0', '--user-data-dir=' + profile, '--no-first-run', '--no-default-browser-check',
+    '--disable-extensions', '--disable-sync', '--window-size=640,480', 'about:blank'];
+  if (headless) args.unshift('--headless=new');
+  if (process.env.CDP_EXTRA_ARGS) args.unshift(...process.env.CDP_EXTRA_ARGS.split(' '));
+  const proc = spawn(browser, args, { stdio: 'ignore' });
+  const cleanup = async () => { try { proc.kill(); } catch {} await sleep(800); try { fs.rmSync(profile, { recursive: true, force: true }); } catch {} };
+  try {
+    let port;
+    for (let i = 0; i < 100 && !port; i++) {
+      await sleep(200);
+      try { port = fs.readFileSync(path.join(profile, 'DevToolsActivePort'), 'utf8').split(/\r?\n/)[0]; } catch {}
+    }
+    if (!port) throw new Error('browser did not start');
+    const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+    const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    const page = targets.find((t) => t.type === 'page');
+    if (!page) throw new Error('no browser tab');
+    const ws = new WebSocket(page.webSocketDebuggerUrl);
+    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('cannot connect to browser')); });
+    let id = 0; const pending = new Map();
+    ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); } };
+    const send = (method, params = {}) => new Promise((res, rej) => {
+      const n = ++id; pending.set(n, (m) => (m.error ? rej(new Error(m.error.message)) : res(m.result)));
+      ws.send(JSON.stringify({ id: n, method, params }));
+    });
+    const evaluate = async (expression) => (await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true })).result.value;
+    await send('Network.enable');
+    await send('Network.setUserAgentOverride', { userAgent: String(version['User-Agent']).replace('HeadlessChrome', 'Chrome') });
+    await send('Page.navigate', { url: base + files[0] });
+    const deadline = Date.now() + (headless ? 30000 : 120000);
+    let ready = false;
+    while (Date.now() < deadline) {
+      await sleep(1000);
+      try { ready = await evaluate(`location.origin === ${JSON.stringify(origin)} && /json/i.test(document.contentType)`); } catch {}
+      if (ready) break;
+    }
+    if (!ready) throw new Error('Cloudflare check did not clear');
+    const got = {};
+    for (const name of files) {
+      const r = await evaluate(`fetch(${JSON.stringify(base + name)}, {credentials: 'include', cache: 'no-store'})
+        .then(async (r) => ({ status: r.status, type: r.headers.get('content-type') || '', text: r.ok ? await r.text() : '' }))
+        .catch((e) => ({ status: 0, type: '', text: '', error: String(e) }))`);
+      got[name] = r;
+    }
+    ws.close();
+    return got;
+  } finally { await cleanup(); }
+}
+
+let result = null, lastError = null;
+for (const headless of [true, false]) {
+  try {
+    if (!headless) console.log('Opening a browser window to pass the claude.ai check; complete it there if asked.');
+    result = await session(headless);
+    if (result[files[0]] && result[files[0]].status === 200) break;
+    lastError = new Error('HTTP ' + (result[files[0]] ? result[files[0]].status : 0));
+  } catch (e) { lastError = e; result = null; console.log('Browser attempt failed: ' + e.message); }
+}
+if (!result || !result[files[0]] || result[files[0]].status !== 200) {
+  console.error('ERROR: Browser download failed: ' + (lastError ? lastError.message : 'unknown'));
+  process.exit(1);
+}
+for (const name of files) {
+  const r = result[name];
+  if (r && r.status === 200 && /json/i.test(r.type)) {
+    const target = path.join(outDir, ...name.split('/'));
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, r.text, 'utf8');
+    console.log('Downloaded ' + name);
+  } else {
+    console.log('Skipped ' + name + ' (HTTP ' + (r ? r.status : 0) + ')');
+  }
+}
+'@
+    $fetcherPath = Join-Path ([IO.Path]::GetTempPath()) ('claude-i18n-' + [Guid]::NewGuid().ToString('N') + '.mjs')
+    [IO.File]::WriteAllText($fetcherPath,$fetcher,[Text.UTF8Encoding]::new($false))
+    try {
+        & $NodePath $fetcherPath $browser $Directory @Names | ForEach-Object { Write-Host ('    ' + $_) }
+        if ($LASTEXITCODE -ne 0) { return "browser fetch exited with $LASTEXITCODE" }
+    } finally { Remove-Item -LiteralPath $fetcherPath -Force -ErrorAction SilentlyContinue }
+    if (-not (Test-Path -LiteralPath (Join-Path $Directory $Names[0]) -PathType Leaf)) { return 'catalog was not saved' }
+    return $null
+}
 function Save-LanguageCatalogs([string]$Directory) {
     # Use the Windows network stack (system proxy, Schannel TLS) rather than
     # Python's urllib, which ignores some proxy setups and fails TLS through
@@ -374,7 +492,16 @@ function Save-LanguageCatalogs([string]$Directory) {
         }
         if ($lastError) {
             if ($files[$name]) {
-                throw ("Cannot download $base$name ($lastError). Check the network or proxy, or use -LanguageDir with an offline copy, or -NoLanguage to skip Chinese. No permissions or application files changed.")
+                # claude.ai answers non-browser clients with a Cloudflare
+                # challenge (HTTP 403). Fall back to a real Edge/Chrome, which
+                # passes the check the same way the user's own browser does.
+                Info "Direct download refused ($lastError); retrying through Microsoft Edge/Chrome..."
+                Get-ChildItem -LiteralPath $Directory -Force | Remove-Item -Recurse -Force
+                $browserError = Save-LanguageCatalogsWithBrowser $Directory @($files.Keys)
+                if ($browserError) {
+                    throw ("Cannot download $base$name (direct: $lastError; browser: $browserError). Use -LanguageDir with an offline copy, or -NoLanguage to skip Chinese. No permissions or application files changed.")
+                }
+                break
             }
             Write-Warning "Skipping optional catalog $name ($lastError); missing strings stay English."
         }
